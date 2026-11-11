@@ -23,6 +23,8 @@ TI_FAULT_FRAMES = round(TorqueInterceptorParams.FAULT_T / DT_CTRL)
 TI_NOT_READY_ALERT_FRAMES = round(TorqueInterceptorParams.NOT_READY_ALERT_T / DT_CTRL)
 TI_BOOT_FRAMES = round(TorqueInterceptorParams.BOOT_T / DT_CTRL)
 TI_DRIVER_OVER_RELEASE_FRAMES = round(TorqueInterceptorParams.DRIVER_OVER_RELEASE_T / DT_CTRL)
+TI_REFIT_FRAMES = round(TorqueInterceptorParams.REFIT_T / DT_CTRL)
+TI_BYPASS_FRAMES = round(TorqueInterceptorParams.BYPASS_T / DT_CTRL)
 # Bus witnesses: vehicle messages whose silence means the bus is gone, not the radar, over the
 # CANParser's own ten-period validity window. {message: (signal, fresh frames)}
 MAIN_CAN_WITNESSES = {"PEDALS": ("ACC_ACTIVE", round(0.2 / DT_CTRL)), "ENGINE_DATA": ("SPEED", round(0.1 / DT_CTRL))}
@@ -87,7 +89,7 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     self.ti_ready = False
     self.ti_fresh = False
     self.ti_feedback_seen = False
-    self.ti_feedback_silent_frames = TI_FEEDBACK_FRESH_FRAMES
+    self.ti_feedback_silent_frames = TI_BYPASS_FRAMES
     self.ti_version = 0
     self.ti_state = int(TorqueInterceptorState.DISCOVER)
     self.ti_violation = 0
@@ -96,12 +98,14 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     self.ti_rejected = False
     # Frames the controller has streamed the TI's command; the TI answers within one.
     self.ti_stream_frames = 0
-    # Frames in a row the TI has been unfit with nothing to excuse it (update_torque_interceptor_fault),
-    # and since the driver last held the wheel.
+    # Frames the TI has been unfit with nothing to excuse it, kept until it has been fit for
+    # ti_fit_frames in a row (update_torque_interceptor_fault), and frames since the driver last
+    # held the wheel.
     self.ti_unfit_frames = 0
+    self.ti_fit_frames = 0
     self.ti_unpressed_frames = TI_DRIVER_OVER_RELEASE_FRAMES
-    # Unfit for NOT_READY_ALERT_T: card publishes it as CarStateZP.torqueInterceptorNotReady and
-    # the driver is told by name.
+    # Unfit for NOT_READY_ALERT_T: card publishes it as CarStateZP.torqueInterceptor.notReady
+    # and the driver is told by name.
     self.ti_not_ready = False
 
     self.distance_button = 0
@@ -213,7 +217,7 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
       self.ti_feedback_seen = True
       self.ti_feedback_silent_frames = 0
     else:
-      self.ti_feedback_silent_frames = min(self.ti_feedback_silent_frames + 1, TI_FEEDBACK_FRESH_FRAMES)
+      self.ti_feedback_silent_frames = min(self.ti_feedback_silent_frames + 1, TI_BYPASS_FRAMES)
     fresh = self.ti_fresh = self.ti_feedback_seen and self.ti_feedback_silent_frames < TI_FEEDBACK_FRESH_FRAMES
 
     self.ti_version = int(feedback["VERSION_NUMBER"])
@@ -234,19 +238,29 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     """Whether an unfit interceptor is a steer fault this frame; also keeps ti_not_ready.
 
     Its command is zero on the first unfit frame regardless (the controller). This decides
-    when that costs the driver lateral and when the interceptor is named to them.
+    when that costs the driver lateral and when the interceptor is named to them. Unfit frames
+    add up until it has been fit for REFIT_T: each one restarts its command from zero, so
+    unfitness that comes in bursts steers no better than unfitness that stays.
     """
     self.ti_unpressed_frames = 0 if steering_pressed else min(self.ti_unpressed_frames + 1, TI_DRIVER_OVER_RELEASE_FRAMES)
     # Stepping aside for a driver who is steering through it is the interceptor working.
     driver_over = (self.ti_fresh and self.ti_state == TorqueInterceptorState.DRIVER_OVER and
                    self.ti_unpressed_frames < TI_DRIVER_OVER_RELEASE_FRAMES)
-    # Stopped, it is sent nothing and may sit out the stop in its own time. Silent, it is
-    # unplugged, unpowered, or bus 1 is not on the OBD-II pins: that is wrong at any speed, once
-    # the command stream it answers to is up.
     moving = v_ego_raw >= TorqueInterceptorParams.MIN_SPEED
+    # Silent, it is unplugged, unpowered, or bus 1 is not on the OBD-II pins: that is wrong at
+    # any speed, once the command stream it answers to is up.
     silent = not self.ti_fresh and self.ti_stream_frames > 0
-    unfit = not self.ti_ready and not driver_over and (moving or silent)
-    self.ti_unfit_frames = min(self.ti_unfit_frames + 1, TI_NOT_READY_ALERT_FRAMES) if unfit else 0
+    if self.ti_ready or driver_over:
+      self.ti_fit_frames = min(self.ti_fit_frames + 1, TI_REFIT_FRAMES)
+      if self.ti_fit_frames >= TI_REFIT_FRAMES:
+        self.ti_unfit_frames = 0
+    else:
+      self.ti_fit_frames = 0
+      # Stopped, it is sent nothing and may sit out the stop in its own time: those frames are
+      # not counted against it, and what was counted while the car moved is kept, so a latch
+      # the driver was told of is not forgotten at a red light.
+      if moving or silent:
+        self.ti_unfit_frames = min(self.ti_unfit_frames + 1, TI_NOT_READY_ALERT_FRAMES)
     self.ti_not_ready = self.ti_unfit_frames >= TI_NOT_READY_ALERT_FRAMES and self.ti_stream_frames >= TI_BOOT_FRAMES
     return moving and self.ti_unfit_frames > TI_FAULT_FRAMES
 
@@ -283,9 +297,11 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     steer_threshold, steer_pressed_frames = LKAS_LIMITS.STEER_THRESHOLD, 5
     if self.ti_enabled:
       # The interceptor biases the signal the EPS reports above, so the driver's torque is its
-      # own reading of the sensor. Silent, it is in bypass and the EPS's reading is the driver's.
+      # own reading of the sensor. Gone silent it may bias on until its watchdogs put it in
+      # bypass: its last reading stands for BYPASS_T, and only then is the EPS's the driver's.
+      # One never heard is in bypass from the start.
       ti_torque = self.update_torque_interceptor(can_parsers)
-      if self.ti_fresh:
+      if self.ti_feedback_seen and self.ti_feedback_silent_frames < TI_BYPASS_FRAMES:
         ret.steeringTorque = ti_torque
         steer_threshold, steer_pressed_frames = TorqueInterceptorParams.STEER_THRESHOLD, TorqueInterceptorParams.STEER_PRESSED_FRAMES
         if abs(ti_torque) > TorqueInterceptorParams.STEER_OVERRIDE_NOW:

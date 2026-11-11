@@ -197,10 +197,13 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
   def update_torque_interceptor(self, CC, CS) -> int:
     """The Torque Interceptor's command: the controller's torque on its own scale and limits.
 
-    It rides beside the EPS command above, which is unchanged. The request is zero unless
-    openpilot is steering, the interceptor reports itself fit and the car is moving; it gets
-    there at the interceptor's own down rate rather than in one step, which a driver feels as
-    a tug at low speed.
+    It rides beside the EPS command above, which comes from the same controller torque (and so
+    stops at the interceptor's rail). The request is zero unless openpilot is steering, the
+    interceptor reports itself fit and the car is moving. When openpilot lets go, or the car
+    slows through MIN_SPEED, it walks down at the interceptor's own down rate rather than in one
+    step, which a driver feels as a tug at low speed. That is for as long as the panda still
+    lets openpilot steer: a brake, a cancel or main off takes the panda's permission first, the
+    frame on its way is refused, and the next is the zero below.
     """
     ti = TorqueInterceptorParams
     if CS.ti_rejected or not CS.ti_ready:
@@ -249,12 +252,13 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     """The alert frame at 2 Hz, mirroring the camera's own HUD state.
 
     The hands-on-wheel warning is the steerRequired alert above the LKAS speed floor, as
-    DashSteerWarning lets it through. The MADS white wheel rides the same frame.
+    DashSteerWarning lets it through; with a Torque Interceptor, which steers below that floor,
+    at any speed. The MADS white wheel rides the same frame.
     """
     visual_alert = CC.hudControl.visualAlert
     steer_required = visual_alert == VisualAlert.steerRequired
     # TODO: find a way to silence audible warnings so we can add more hud alerts
-    steer_required = steer_required and CS.lkas_allowed_speed
+    steer_required = steer_required and (CS.lkas_allowed_speed or self.torque_interceptor)
     steer_required = self.dash_steer_warning.update(self.frame, steer_required, CC.latActive, CC.enabled,
                                                     CS.out.brakePressed)
     white = self.update_white_hud(CC, CC_SP, CS, self.radar_session.handback_active)

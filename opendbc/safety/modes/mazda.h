@@ -42,7 +42,7 @@
 // board code reads the same bit to put CAN2 on the OBD-II pins.
 #define MAZDA_PARAM_TI 8U
 // TI_FEEDBACK is 50 Hz. Older than this, the interceptor no longer vouches for itself and the
-// driver torque it measures is too stale to limit against. The controller stops at 60 ms
+// driver torque it measures is too stale to limit against. The controller stops at 70 ms
 // (values' TorqueInterceptorParams.FEEDBACK_TIMEOUT), inside this.
 #define MAZDA_TI_FEEDBACK_TIMEOUT_US 100000U
 // TI_FEEDBACK.STATE: the interceptor applies its bias in this state only.
@@ -78,7 +78,8 @@ static void mazda_ti_reset_torque_state(void) {
 }
 
 // A healthy frame recent enough to act on. Staleness latches until the next healthy frame, so a
-// timer wrap cannot make an old one look fresh again.
+// timer wrap cannot make an old one look fresh again: called on every frame the mode hears and
+// on every interceptor command, steering or not.
 static bool mazda_ti_feedback_fresh(void) {
   if (safety_get_ts_elapsed(microsecond_timer_get(), mazda_ti_feedback_ts) > MAZDA_TI_FEEDBACK_TIMEOUT_US) {
     mazda_ti_healthy = false;
@@ -95,6 +96,12 @@ static bool mazda_get_quality_flag_valid(const CANPacket_t *msg) {
     // The torque byte is sent twice in place of a checksum, every firmware reports a nonzero
     // version, and there are four states.
     valid = (msg->data[0] == msg->data[1]) && (msg->data[2] != 0U) && (msg->data[3] <= MAZDA_TI_STATE_RUN);
+    if (!valid) {
+      // The frame carries the driver torque both commands are limited against, and it is not
+      // sampled. An invalid RX check takes controls_allowed alone; MADS lateral goes with it
+      // here, or 0x243 would be admitted against the last readings for as long as the host asks.
+      mads_exit_controls(MADS_DISENGAGE_REASON_LAG);
+    }
     // RAMP_DOWN: the interceptor is taking its bias to zero by itself and ignores the request
     // until that reads zero. Firmware version 1 has no such byte.
     bool ramp_down = (msg->data[2] > 1U) && (msg->data[6] != 0U);
@@ -157,6 +164,11 @@ static bool mazda_radar_capture_msg_valid(const CANPacket_t *msg) {
 
 // track msgs coming from OP so that we know what CAM msgs to drop and what to forward
 static void mazda_rx_hook(const CANPacket_t *msg) {
+  if (mazda_ti) {
+    // keep the staleness latch current while nothing is being sent to the interceptor
+    (void)mazda_ti_feedback_fresh();
+  }
+
   if ((int)msg->bus == MAZDA_MAIN) {
     if (msg->addr == MAZDA_ENGINE_DATA) {
       // sample speed: scale by 0.01 to get kph
@@ -284,7 +296,9 @@ static bool mazda_ti_torque_cmd_checks(int desired_torque) {
   };
 
   bool violation = false;
-  bool allowed = mazda_openpilot_controlling() && mazda_ti_feedback_fresh();
+  // evaluated on every command, steering or not: it latches staleness
+  bool fresh = mazda_ti_feedback_fresh();
+  bool allowed = mazda_openpilot_controlling() && fresh;
   uint32_t ts = microsecond_timer_get();
 
   if (allowed) {
@@ -566,7 +580,7 @@ static safety_config mazda_init(uint16_t param) {
   };
 
   // TI_FEEDBACK joins the checks: the interceptor must be heard from, and each frame well formed
-  // (mazda_get_quality_flag_valid), for controls to be allowed at all.
+  // (mazda_get_quality_flag_valid), for cruise controls or MADS lateral to be allowed at all.
   static RxCheck mazda_ti_rx_checks[] = {
     {.msg = {{MAZDA_CRZ_CTRL,     0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},

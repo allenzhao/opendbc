@@ -155,9 +155,11 @@ class TorqueInterceptorParams:
   # Frames a request may sit on one value, other than 0 and the clip, before it is moved a count.
   STEER_HELD_FRAMES = 25
 
-  # Counts per unit of normalized torque. The EPS command is u x EPS_STEER_MAX and the tune is on
-  # that scale (TUNE_SCALE x upstream's), so the TI's share keeps upstream's ratio to it: the
-  # 800:600 the TI was developed and driven on.
+  # Counts per unit of normalized torque. The EPS command is u x EPS_STEER_MAX on a tune
+  # TUNE_SCALE x upstream's, so this is upstream's u x 600: three quarters of the EPS command's
+  # count, the pairing pdscomp's port ran on legacy firmware (an 800 count EPS command beside
+  # u x 600). The TI author's own fork sends the TI the same count as the EPS command, clipped
+  # to 600, which on this scale would be 1200.
   STEER_SCALE = round(STEER_MAX * CarControllerParams.TUNE_SCALE)
 
   # steeringPressed on the TI's reading of the real sensor (the EPS's own is the biased signal).
@@ -165,18 +167,28 @@ class TorqueInterceptorParams:
   STEER_PRESSED_FRAMES = 5
   STEER_OVERRIDE_NOW = 20         # above this, pressed at once: no need to out-wait the filter
 
-  # No request below this speed, and lateral is off below it (minSteerSpeed). Held still, the
-  # command stops moving and the TI reads a stuck sender; a stopped car needs no lateral
-  # authority either.
+  # No request below this speed. Held still, the command stops moving and the TI reads a stuck
+  # sender; a stopped car needs no lateral authority either. On legacy firmware lateral is off
+  # below it too (minSteerSpeed); on steer-to-zero firmware the EPS command carries on alone,
+  # as it does without the TI, and the reported actuator reads zero there.
   MIN_SPEED = 1.0                 # m/s
 
-  # TI_FEEDBACK is 50 Hz. Two frames may go missing; past that the TI no longer vouches for
-  # itself and its command returns to zero. Inside the panda's 100 ms
-  # (mazda.h's MAZDA_TI_FEEDBACK_TIMEOUT_US), so the controller stops before it is refused.
-  FEEDBACK_TIMEOUT = 0.06         # s
+  # TI_FEEDBACK is 50 Hz. Two frames may go missing, with a cycle of jitter to spare; past
+  # that the TI no longer vouches for itself and its command returns to zero. Inside the
+  # panda's 100 ms (mazda.h's MAZDA_TI_FEEDBACK_TIMEOUT_US), so a controller that has stopped
+  # hearing it stops before it is refused.
+  FEEDBACK_TIMEOUT = 0.07         # s
   # Unfit this long while the car moves is a steer fault. Anything shorter costs its command
-  # for those frames and a ramp back, not the driver's lateral.
-  FAULT_T = 0.2                   # s
+  # for those frames and a ramp back from zero, not the driver's lateral. The longest feedback
+  # pause on record is 242 ms (pdscomp's logs).
+  FAULT_T = 0.3                   # s
+  # Unfit frames add up until it has been fit this long: every one restarts its command from
+  # zero, so unfitness in bursts steers no better than unfitness that stays.
+  REFIT_T = 0.5                   # s
+  # Gone silent, it may still be biasing the sensor until its own watchdogs put it in bypass
+  # (its documentation: 0.6 s for a lost CAN link, 1.09 s for a hung CPU). Until then the EPS's
+  # reading is not the driver's and the TI's last one stands.
+  BYPASS_T = 1.2                  # s
   # Unfit, or silent under a running command stream, this long: the driver is told by name
   # (CarState.ti_not_ready).
   NOT_READY_ALERT_T = 2.0         # s

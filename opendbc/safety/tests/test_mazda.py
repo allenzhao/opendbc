@@ -1140,6 +1140,33 @@ class TestMazdaTorqueInterceptorCommand(unittest.TestCase):
       self.assertFalse(self._tx(TI.STEER_DELTA_UP), feedback)
       self.assertTrue(self._tx(0))
 
+  def test_a_malformed_feedback_frame_takes_mads_lateral_too(self):
+    # The frame carries the driver torque both commands are limited against, and a malformed one
+    # is not sampled. An invalid RX check takes controls_allowed alone: under MADS lateral would
+    # stay up and 0x243 be admitted against the last readings for as long as the host asks.
+    eps = lambda torque: self.safety.safety_tx_hook(self.packer.make_can_msg_safety("CAM_LKAS", 0, {"LKAS_REQUEST": torque}))  # noqa: E731
+    self.safety.set_mads_params(True, False, False)
+    try:
+      for feedback in (dict(version=0), dict(state=4), dict(torque=5, copy=0x7F)):
+        self._advance(FRAME_US)
+        self.assertTrue(self._hear())
+        # set after the RX hook, which runs the MADS state machine
+        self.safety.set_controls_allowed_lateral(True)
+        self.assertTrue(eps(0))
+        # fit, then unfit but well formed: lateral stays, only the interceptor's torque goes
+        for well_formed in ({}, dict(state=TorqueInterceptorState.OFF, viol=0x11), dict(state=TorqueInterceptorState.DRIVER_OVER)):
+          self.assertTrue(self._hear(**well_formed))
+          self.assertTrue(self.safety.get_controls_allowed_lateral(), well_formed)
+          self.assertTrue(eps(0), well_formed)
+        self.assertFalse(self._hear(**feedback), feedback)
+        self.assertFalse(self.safety.get_controls_allowed_lateral(), feedback)
+        self.assertFalse(eps(0), feedback)
+        # the interceptor keeps its idle stream
+        self.assertTrue(self._tx(0))
+    finally:
+      self.safety.set_mads_params(False, False, False)
+      self.safety.set_controls_allowed_lateral(False)
+
   def test_feedback_must_be_fresh(self):
     self._tx(0)
     self._hear()
@@ -1161,6 +1188,27 @@ class TestMazdaTorqueInterceptorCommand(unittest.TestCase):
     self.assertFalse(self._tx(TI.STEER_DELTA_UP))
     self._hear()
     self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+
+  def test_staleness_latches_while_openpilot_is_not_steering(self):
+    # The same wrap with nothing engaged through the silence: the latch is kept by every frame
+    # the mode hears and every idle command, not only by torque checked while steering.
+    for witness in ("idle command", "vehicle frame"):
+      self.safety.set_controls_allowed(True)
+      self._hear()
+      self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+      self.safety.set_controls_allowed(False)
+      self.assertTrue(self._tx(0))
+      self._advance(TI_FEEDBACK_TIMEOUT_US + 1)
+      if witness == "idle command":
+        self.assertTrue(self._tx(0))
+      else:
+        self.safety.safety_rx_hook(self.packer.make_can_msg_safety("ENGINE_DATA", 0, {}))
+      # 71 minutes on, the timer reads as it did 50 ms after that last frame
+      self._advance(-(TI_FEEDBACK_TIMEOUT_US // 2))
+      self.safety.set_controls_allowed(True)
+      self.assertFalse(self._tx(TI.STEER_DELTA_UP), witness)
+      self.assertTrue(self._tx(0))
+      self._advance(TI_FEEDBACK_TIMEOUT_US)
 
   def test_an_unfit_frame_does_not_refresh_the_last_fit_one(self):
     self._hear()
