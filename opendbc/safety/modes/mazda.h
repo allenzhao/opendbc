@@ -379,6 +379,14 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   // Run after steering checks, which reset rate-limit state while disengaged.
   if (main_bus && mazda_is_lka_addr(msg->addr) && !mazda_openpilot_controlling()) {
     tx = false;
+    // Those checks take cruise alone for permission. Under MADS with cruise engaged and lateral
+    // off they follow the host's request on frames refused here, and the first frame after
+    // lateral rises could be a step. Restart the ramp with every refusal instead.
+    if (msg->addr == MAZDA_LKAS) {
+      desired_torque_last = 0;
+      rt_torque_last = 0;
+      ts_torque_check_last = microsecond_timer_get();
+    }
   }
 
   if ((msg->bus == (unsigned char)MAZDA_AUX) && (msg->addr == MAZDA_TI_LKAS)) {

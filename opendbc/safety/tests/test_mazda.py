@@ -111,6 +111,29 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
           self._set_prev_torque(t)
           self.assertEqual(bool(enabled) and abs(t) <= max_torque, self._tx(self._torque_cmd_msg(t)))
 
+  def test_a_ramp_refused_under_mads_does_not_carry_into_lateral(self):
+    # MADS on, cruise engaged, lateral off: every 0x243 is refused, and the rate checks behind
+    # the refusal must not have followed the host up, or the first frame after lateral rises
+    # could be a step to wherever it had got to
+    self.safety.set_mads_params(True, False, False)
+    try:
+      for sign in (1, -1):
+        self._reset_torque_driver_measurement(0)
+        self.safety.set_controls_allowed(True)
+        self.safety.set_controls_allowed_lateral(False)
+        torque = 0
+        for _ in range(self.MAX_RT_DELTA // (2 * self.MAX_RATE_UP)):  # inside the realtime limit: the ramp alone is legal
+          torque += sign * self.MAX_RATE_UP
+          self.assertFalse(self._tx(self._torque_cmd_msg(torque)))
+        self.assertGreater(abs(torque), 2 * self.MAX_RATE_UP)
+        self.safety.set_controls_allowed_lateral(True)
+        self.assertFalse(self._tx(self._torque_cmd_msg(torque)))
+        self.assertTrue(self._tx(self._torque_cmd_msg(sign * self.MAX_RATE_UP)))
+        self.assertTrue(self._tx(self._torque_cmd_msg(0)))
+    finally:
+      self.safety.set_mads_params(False, False, False)
+      self.safety.set_controls_allowed_lateral(False)
+
   def test_stock_passthrough(self):
     # one sender per address, the Tesla test_stock_lkas_passthrough shape: the camera owns
     # 0x243/0x440 whenever openpilot is not steering (stock lane keep, TJA/CTS and dash LDW
