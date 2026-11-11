@@ -28,7 +28,8 @@ VIN_TAIL = "KF4WLA10114918"
 WMIS = get_interface_attr("WMI", ignore_none=True)
 # The keys setup_interfaces reads; 1-3 covers every LongitudinalTuningType and MadsScreenButtonType.
 TOGGLE_KEYS = ("HyundaiLongitudinalTuning", "MazdaTjaButton", "SubaruStopAndGo", "SubaruStopAndGoManualParkingBrake",
-               "TeslaCoopSteering", "TeslaMadsScreenButton", "ToyotaEnforceStockLongitudinal", "ToyotaStopAndGoHack")
+               "TeslaCoopSteering", "TeslaMadsScreenButton", "TorqueInterceptorEnabled", "ToyotaEnforceStockLongitudinal",
+               "ToyotaStopAndGoHack")
 TOGGLE_SETS = [None] + [[dict.fromkeys(TOGGLE_KEYS, v)] for v in ("1", "2", "3")]
 
 

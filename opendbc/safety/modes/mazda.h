@@ -25,14 +25,28 @@
 #define MAZDA_STEER_TORQUE  0x240U
 #define MAZDA_ENGINE_DATA   0x202U
 #define MAZDA_PEDALS        0x165U
+// Torque Interceptor: its command and, one address up, its feedback. Both travel the OBD-II CAN
+// pair that Comma Power carries, which is bus 1 once the panda multiplexes CAN2 onto it.
+#define MAZDA_TI_LKAS       0x249U
+#define MAZDA_TI_FEEDBACK   0x24aU
 
 // CAN bus numbers
 #define MAZDA_MAIN 0
+#define MAZDA_AUX  1
 #define MAZDA_CAM  2
 
 #define MAZDA_PARAM_LONGITUDINAL 1U
 // The measured gen1 EPS envelope; the interface sets it on every Mazda it admits.
 #define MAZDA_PARAM_EPS_HW 2U
+// A Torque Interceptor is fitted (values' MazdaSafetyFlags.TORQUE_INTERCEPTOR). The panda's
+// board code reads the same bit to put CAN2 on the OBD-II pins.
+#define MAZDA_PARAM_TI 8U
+// TI_FEEDBACK is 50 Hz. Older than this, the interceptor no longer vouches for itself and the
+// driver torque it measures is too stale to limit against. The controller stops at 60 ms
+// (values' TorqueInterceptorParams.FEEDBACK_TIMEOUT), inside this.
+#define MAZDA_TI_FEEDBACK_TIMEOUT_US 100000U
+// TI_FEEDBACK.STATE: the interceptor applies its bias in this state only.
+#define MAZDA_TI_STATE_RUN 3U
 
 // Keep SET/RES intent fresh until PEDALS reports engagement.
 #define MAZDA_ENGAGE_BTN_WINDOW 10U
@@ -44,10 +58,56 @@ static bool mazda_longitudinal = false;
 // Declared by the driver: the TJA button owns lateral and MRCC no longer drives the main edge.
 static bool mazda_tja_button = false;
 static bool mazda_eps_hw = false;
+static bool mazda_ti = false;
+// The last TI_FEEDBACK frame was well formed and reported RUN with no violation, error or ramp-down.
+static bool mazda_ti_healthy = false;
+static uint32_t mazda_ti_feedback_ts = 0U;
+// The interceptor command's own history: steer_torque_cmd_checks' globals belong to 0x243.
+static int mazda_ti_desired_torque_last = 0;
+static int mazda_ti_rt_torque_last = 0;
+static uint32_t mazda_ti_ts_torque_check_last = 0U;
 // Live cruise arming from PEDALS, both longitudinal modes (carstate mrcc_armed_raw).
 static bool mazda_acc_armed = false;
 static uint32_t mazda_engage_btn_frames = 0U;
 static uint32_t mazda_main_off_samples = 0U;
+
+static void mazda_ti_reset_torque_state(void) {
+  mazda_ti_desired_torque_last = 0;
+  mazda_ti_rt_torque_last = 0;
+  mazda_ti_ts_torque_check_last = microsecond_timer_get();
+}
+
+// A healthy frame recent enough to act on. Staleness latches until the next healthy frame, so a
+// timer wrap cannot make an old one look fresh again.
+static bool mazda_ti_feedback_fresh(void) {
+  if (safety_get_ts_elapsed(microsecond_timer_get(), mazda_ti_feedback_ts) > MAZDA_TI_FEEDBACK_TIMEOUT_US) {
+    mazda_ti_healthy = false;
+  }
+  return mazda_ti_healthy;
+}
+
+// The RX check's quality flag for TI_FEEDBACK, the one message that has one. It answers whether
+// the frame is well formed; whether the interceptor is fit to take torque is recorded beside it,
+// because the RX hook never sees a frame this turns away.
+static bool mazda_get_quality_flag_valid(const CANPacket_t *msg) {
+  bool valid = true;
+  if (msg->addr == MAZDA_TI_FEEDBACK) {
+    // The torque byte is sent twice in place of a checksum, every firmware reports a nonzero
+    // version, and there are four states.
+    valid = (msg->data[0] == msg->data[1]) && (msg->data[2] != 0U) && (msg->data[3] <= MAZDA_TI_STATE_RUN);
+    // RAMP_DOWN: the interceptor is taking its bias to zero by itself and ignores the request
+    // until that reads zero. Firmware version 1 has no such byte.
+    bool ramp_down = (msg->data[2] > 1U) && (msg->data[6] != 0U);
+    // OFF and DRIVER_OVER are ordinary (boot, a latched violation, the driver steering through
+    // it): no reason to drop controls, every reason to send no torque.
+    mazda_ti_healthy = valid && (msg->data[3] == MAZDA_TI_STATE_RUN) &&
+                       (msg->data[4] == 0U) && (msg->data[5] == 0U) && !ramp_down;
+    if (mazda_ti_healthy) {
+      mazda_ti_feedback_ts = microsecond_timer_get();
+    }
+  }
+  return valid;
+}
 
 static bool mazda_mrcc_off_msg_valid(const CANPacket_t *msg) {
   // Exact active-low MRCC master tap. CTR occupies the variable bits in byte 3;
@@ -104,7 +164,9 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
       vehicle_moving = speed > 10; // moving when speed > 0.1 kph
     }
 
-    if (msg->addr == MAZDA_STEER_TORQUE) {
+    // With a Torque Interceptor the EPS reports the biased signal here; the driver's torque is
+    // the interceptor's own reading of the sensor, sampled below.
+    if ((msg->addr == MAZDA_STEER_TORQUE) && !mazda_ti) {
       int torque_driver_new = msg->data[0] - 127U;
       // update array of samples
       update_sample(&torque_driver, torque_driver_new);
@@ -188,6 +250,11 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
       brake_pressed = brake;
     }
   }
+
+  if (mazda_ti && ((int)msg->bus == MAZDA_AUX) && (msg->addr == MAZDA_TI_FEEDBACK)) {
+    int torque_driver_new = msg->data[0] - 127U;
+    update_sample(&torque_driver, torque_driver_new);
+  }
 }
 
 static bool mazda_is_lka_addr(int addr) {
@@ -199,6 +266,52 @@ static bool mazda_is_lka_addr(int addr) {
 // not claim them, or it silences the camera's own TJA/CTS while the dash shows nothing.
 static bool mazda_openpilot_controlling(void) {
   return controls_allowed_lateral || (controls_allowed && !m_mads_state.system_enabled);
+}
+
+// steer_torque_cmd_checks for the interceptor's command, on its own history. Torque needs
+// openpilot steering, as 0x243 does, and an interceptor that reports itself fit; anything else
+// admits the zero request only, which keeps the stream the interceptor requires alive.
+static bool mazda_ti_torque_cmd_checks(int desired_torque) {
+  // values' TorqueInterceptorParams. The interceptor clips at 600 itself.
+  const TorqueSteeringLimits MAZDA_TI_STEERING_LIMITS = {
+    .max_torque = 600,
+    .max_rate_up = 6,
+    .max_rate_down = 15,
+    .max_rt_delta = 192,
+    .driver_torque_multiplier = 40,
+    .driver_torque_allowance = 15,
+    .type = TorqueDriverLimited,
+  };
+
+  bool violation = false;
+  bool allowed = mazda_openpilot_controlling() && mazda_ti_feedback_fresh();
+  uint32_t ts = microsecond_timer_get();
+
+  if (allowed) {
+    violation |= safety_max_limit_check(desired_torque, MAZDA_TI_STEERING_LIMITS.max_torque, -MAZDA_TI_STEERING_LIMITS.max_torque);
+    violation |= driver_limit_check(desired_torque, mazda_ti_desired_torque_last, &torque_driver,
+                                    MAZDA_TI_STEERING_LIMITS.max_torque, MAZDA_TI_STEERING_LIMITS.max_rate_up,
+                                    MAZDA_TI_STEERING_LIMITS.max_rate_down, MAZDA_TI_STEERING_LIMITS.driver_torque_allowance,
+                                    MAZDA_TI_STEERING_LIMITS.driver_torque_multiplier);
+    mazda_ti_desired_torque_last = desired_torque;
+
+    violation |= rt_torque_rate_limit_check(desired_torque, mazda_ti_rt_torque_last, MAZDA_TI_STEERING_LIMITS.max_rt_delta);
+    if (safety_get_ts_elapsed(ts, mazda_ti_ts_torque_check_last) > MAX_RT_INTERVAL) {
+      mazda_ti_rt_torque_last = desired_torque;
+      mazda_ti_ts_torque_check_last = ts;
+    }
+  }
+
+  if (!allowed && (desired_torque != 0)) {
+    violation = true;
+  }
+
+  // a refusal, or nothing to steer with, restarts the ramp from zero
+  if (violation || !allowed) {
+    mazda_ti_reset_torque_state();
+  }
+
+  return violation;
 }
 
 static bool mazda_tx_hook(const CANPacket_t *msg) {
@@ -252,6 +365,26 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   // Run after steering checks, which reset rate-limit state while disengaged.
   if (main_bus && mazda_is_lka_addr(msg->addr) && !mazda_openpilot_controlling()) {
     tx = false;
+  }
+
+  if ((msg->bus == (unsigned char)MAZDA_AUX) && (msg->addr == MAZDA_TI_LKAS)) {
+    // The 12-bit request and its copy, each under a clear high nibble, then the interceptor's
+    // 3-byte key and the option byte. Only 0x60, normal run, is sent: 0x61 would cold-reset the
+    // interceptor and clear its latched violations, 0x62 would force it into bypass.
+    uint32_t request = (((uint32_t)msg->data[0] & 0x0FU) << 8) | (uint32_t)msg->data[1];
+    uint32_t request_copy = (((uint32_t)msg->data[2] & 0x0FU) << 8) | (uint32_t)msg->data[3];
+    bool well_formed = ((msg->data[0] & 0xF0U) == 0U) && ((msg->data[2] & 0xF0U) == 0U) && (request == request_copy) &&
+                       (msg->data[4] == 0xc4U) && (msg->data[5] == 0x61U) && (msg->data[6] == 0xceU) && (msg->data[7] == 0x60U);
+    int desired_torque = (int)request - 2048;
+
+    // The torque checks run on every frame: they also keep the command history.
+    if (mazda_ti_torque_cmd_checks(desired_torque)) {
+      tx = false;
+    }
+    if (!mazda_ti || !well_formed) {
+      mazda_ti_reset_torque_state();
+      tx = false;
+    }
   }
 
   if (mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_INFO)) {
@@ -334,6 +467,12 @@ static bool mazda_fwd_hook(int bus_num, int addr) {
     }
   }
 
+  // The interceptor's command belongs to its side channel: never relay it between the car and
+  // the camera, in either direction.
+  if (mazda_ti && ((unsigned int)addr == MAZDA_TI_LKAS)) {
+    block_msg = true;
+  }
+
   return block_msg;
 }
 
@@ -346,6 +485,15 @@ static safety_config mazda_init(uint16_t param) {
     {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
     {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
     {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
+  };
+
+  // The interceptor's lists are the two above and below with its command added, selected by
+  // MAZDA_PARAM_TI alone: without the bit nothing here changes.
+  static const CanMsg MAZDA_TI_TX_MSGS[] = {
+    {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
+    {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_TI_LKAS, MAZDA_AUX, 8, .check_relay = false},
   };
 
 // Replaced-radar addresses omit relay checks because the radar remains live during boot and
@@ -375,6 +523,32 @@ static safety_config mazda_init(uint16_t param) {
     {MAZDA_RADAR_TRACK_6, MAZDA_CAM, 8, .check_relay = false},
   };
 
+  static const CanMsg MAZDA_LONG_TI_TX_MSGS[] = {
+    {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
+    {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_CRZ_INFO, 0, 8, .check_relay = false},
+    {MAZDA_CRZ_CTRL, 0, 8, .check_relay = false},
+    {MAZDA_RADAR_STATIC, 0, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_1, 0, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_2, 0, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_3, 0, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_4, 0, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_5, 0, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_6, 0, 8, .check_relay = false},
+    {MAZDA_RADAR_UDS, 0, 8, .check_relay = false},
+    {MAZDA_CRZ_INFO, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_CRZ_CTRL, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_RADAR_STATIC, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_1, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_2, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_3, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_4, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_5, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_RADAR_TRACK_6, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_TI_LKAS, MAZDA_AUX, 8, .check_relay = false},
+  };
+
   static RxCheck mazda_rx_checks[] = {
     {.msg = {{MAZDA_CRZ_CTRL,     0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -391,13 +565,38 @@ static safety_config mazda_init(uint16_t param) {
     {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
 
+  // TI_FEEDBACK joins the checks: the interceptor must be heard from, and each frame well formed
+  // (mazda_get_quality_flag_valid), for controls to be allowed at all.
+  static RxCheck mazda_ti_rx_checks[] = {
+    {.msg = {{MAZDA_CRZ_CTRL,     0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_TI_FEEDBACK,  MAZDA_AUX, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = false}, { 0 }, { 0 }}},
+  };
+
+  static RxCheck mazda_long_ti_rx_checks[] = {
+    {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_TI_FEEDBACK,  MAZDA_AUX, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = false}, { 0 }, { 0 }}},
+  };
+
   mazda_longitudinal = GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);
   mazda_eps_hw = GET_FLAG(param, MAZDA_PARAM_EPS_HW);
+  mazda_ti = GET_FLAG(param, MAZDA_PARAM_TI);
+  mazda_ti_healthy = false;
+  mazda_ti_feedback_ts = 0U;
+  mazda_ti_reset_torque_state();
   mazda_tja_button = GET_FLAG(current_safety_param_sp, MAZDA_PARAM_SP_TJA_BUTTON);
   acc_main_on = false;
 
-  return mazda_longitudinal ? BUILD_SAFETY_CFG(mazda_long_rx_checks, MAZDA_LONG_TX_MSGS) :
-                              BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
+  return mazda_ti ? (mazda_longitudinal ? BUILD_SAFETY_CFG(mazda_long_ti_rx_checks, MAZDA_LONG_TI_TX_MSGS) :
+                                          BUILD_SAFETY_CFG(mazda_ti_rx_checks, MAZDA_TI_TX_MSGS)) :
+                    (mazda_longitudinal ? BUILD_SAFETY_CFG(mazda_long_rx_checks, MAZDA_LONG_TX_MSGS) :
+                                          BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS));
 }
 
 const safety_hooks mazda_hooks = {
@@ -405,4 +604,5 @@ const safety_hooks mazda_hooks = {
   .rx = mazda_rx_hook,
   .tx = mazda_tx_hook,
   .fwd = mazda_fwd_hook,
+  .get_quality_flag_valid = mazda_get_quality_flag_valid,
 };

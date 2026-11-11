@@ -9,7 +9,7 @@ from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
 from opendbc.car.mazda.longitudinal import AccelShaper, LeadIcon, StandstillHold
 from opendbc.car.mazda.radar_session import RadarSessionManager, RadarSessionState
-from opendbc.car.mazda.values import CarControllerParams, Buttons, MazdaFlags
+from opendbc.car.mazda.values import CarControllerParams, Buttons, MazdaFlags, TorqueInterceptorParams
 
 from opendbc.sunnypilot.car.mazda.icbm import IntelligentCruiseButtonManagementInterface
 from opendbc.sunnypilot.car.mazda.mads import MadsCarController
@@ -67,6 +67,9 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     # The non-delivery latch belongs to the steer-to-zero firmware alone.
     self.steer_to_zero = bool(CP.flags & MazdaFlags.STEER_TO_ZERO_EPS)
     self.g46l = bool(CP.flags & MazdaFlags.G46L_RADAR)
+    self.torque_interceptor = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
+    self.ti_apply_torque_last = 0
+    self.ti_held_frames = 0
     self.apply_torque_last = 0
     self.driver_torque_samples: deque[float] = deque(maxlen=self.params.STEER_DRIVER_SAMPLES)
     self.packer = CANPacker(dbc_names[Bus.pt])
@@ -128,6 +131,14 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     if self.steer_to_zero and (CS.steer_undelivered or CS.steer_first_engage_hold):
       apply_torque = 0
 
+    # With a Torque Interceptor lateral carries on below the legacy firmware's floor and through
+    # its hands-off lockout, where that EPS takes no LKAS request. It is sent none there, as it
+    # never was without the interceptor, and the ramp restarts from zero once it will take one.
+    if self.torque_interceptor and not self.steer_to_zero and (not CS.lkas_allowed_speed or CS.lkas_blocked):
+      apply_torque = 0
+
+    ti_apply_torque = self.update_torque_interceptor(CC, CS) if self.torque_interceptor else 0
+
     # Do not cancel a stock MRCC engagement while the stock radar still owns the bus.
     stock_mrcc_owns_cruise = self.CP.openpilotLongitudinalControl and not CS.radar_was_silenced
     if CC.cruiseControl.cancel and not stock_mrcc_owns_cruise:
@@ -156,6 +167,10 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     # send steering command
     can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,
                                                       self.frame, apply_torque, CS.cam_lkas))
+    if self.torque_interceptor:
+      # Every frame, steering or not: the interceptor faults on a gap in the stream.
+      can_sends.append(mazdacan.create_ti_steering_control(self.packer, ti_apply_torque))
+      CS.ti_stream_frames += 1
 
     # Suppress ICBM while cancel/resume is active or the MRCC cleanup owns CRZ_BTNS:
     # the wheel's press pattern owns the counter stream until release.
@@ -165,13 +180,63 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CC_SP, CS, self.packer, self.frame, self.last_button_frame))
 
     new_actuators = CC.actuators.as_builder()
-    new_actuators.torque = apply_torque / self.params.STEER_MAX
-    new_actuators.torqueOutputCan = apply_torque
+    if self.torque_interceptor:
+      # The interceptor is the actuator at every speed; the lateral stack reads its rail and
+      # slew to match (CarControllerParams.STEER_RAIL_SCHEDULE, STEER_SLEW_SCHEDULE).
+      new_actuators.torque = ti_apply_torque / TorqueInterceptorParams.STEER_SCALE
+      new_actuators.torqueOutputCan = ti_apply_torque
+    else:
+      new_actuators.torque = apply_torque / self.params.STEER_MAX
+      new_actuators.torqueOutputCan = apply_torque
     # Report the command sent on the wire after clipping, holds, slew, and overrides.
     new_actuators.accel = self.accel_last
 
     self.frame += 1
     return new_actuators, can_sends
+
+  def update_torque_interceptor(self, CC, CS) -> int:
+    """The Torque Interceptor's command: the controller's torque on its own scale and limits.
+
+    It rides beside the EPS command above, which is unchanged. The request is zero unless
+    openpilot is steering, the interceptor reports itself fit and the car is moving; it gets
+    there at the interceptor's own down rate rather than in one step, which a driver feels as
+    a tug at low speed.
+    """
+    ti = TorqueInterceptorParams
+    if CS.ti_rejected or not CS.ti_ready:
+      # The panda refuses any torque while openpilot is not steering or the interceptor is
+      # unfit, and a refusal zeroes its rate reference: the ramp restarts from zero as the
+      # panda's does. This frame is a zero, which the panda always admits, so a run of refusals
+      # (the panda's lateral not armed) still leaves the interceptor the stream it faults
+      # without.
+      self.ti_apply_torque_last = 0
+      self.ti_held_frames = 0
+      return 0
+
+    new_torque = 0
+    if CC.latActive and CS.out.vEgoRaw >= ti.MIN_SPEED:
+      new_torque = int(round(CC.actuators.torque * ti.STEER_SCALE))
+
+    # The worst driver torque of the window against the command's direction, as for the EPS
+    # command: the panda limits on its own, fresher samples and must never be the stricter one.
+    if (new_torque or self.ti_apply_torque_last) >= 0:
+      driver_torque = min(self.driver_torque_samples) - self.params.STEER_DRIVER_MARGIN
+    else:
+      driver_torque = max(self.driver_torque_samples) + self.params.STEER_DRIVER_MARGIN
+    apply_torque = apply_driver_steer_torque_limits(new_torque, self.ti_apply_torque_last, driver_torque, ti)
+
+    # The interceptor reads a request that sits still anywhere but 0 or its own clip as a stuck
+    # sender (VIOL_LKAS_STUK) and latches off for 30 s. A steady hand on the wheel pins the
+    # driver limit and a quiet road the controller's own output, so a request that has not
+    # moved for STEER_HELD_FRAMES is moved one count toward zero; the limits bring it back.
+    held = apply_torque == self.ti_apply_torque_last and 0 < abs(apply_torque) < ti.STEER_MAX
+    self.ti_held_frames = self.ti_held_frames + 1 if held else 0
+    if self.ti_held_frames >= ti.STEER_HELD_FRAMES:
+      apply_torque -= 1 if apply_torque > 0 else -1
+      self.ti_held_frames = 0
+
+    self.ti_apply_torque_last = apply_torque
+    return apply_torque
 
   @property
   def stock_ecu_state(self):

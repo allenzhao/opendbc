@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from enum import Enum, IntFlag, StrEnum
+from enum import Enum, IntEnum, IntFlag, StrEnum
 
 from opendbc.car import Bus, CarSpecs, DbcDict, DT_CTRL, PlatformConfig, Platforms
 from opendbc.car.carlog import carlog
@@ -110,6 +110,94 @@ class CarControllerParams:
       # rolling can be a dropout. carstate's first-engagement hold uses the same boundary.
       self.STEER_UNDELIVERED_ALERT_ORIGIN_SPEED = 1.0  # m/s
 
+    if CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      ti = TorqueInterceptorParams
+      # steeringTorque is the Torque Interceptor's own sensor reading, and its command is gone
+      # by allowance + STEER_MAX / multiplier counts of opposing driver torque. The EPS command
+      # gives way over the same span, so a driver who has taken the interceptor's share is not
+      # left fighting the EPS's.
+      self.STEER_OVERRIDE_BP = [ti.STEER_DRIVER_ALLOWANCE, ti.STEER_DRIVER_ALLOWANCE + ti.STEER_MAX // ti.STEER_DRIVER_MULTIPLIER]
+
+      # The interceptor steers at every speed and is the actuator the controller reports
+      # (actuatorsOutput.torque = its command / STEER_SCALE), so the lateral stack reads its
+      # rail and slew instead of the EPS command's (opendbc/sunnypilot/car/lateral_tune.py).
+      # The rail is the interceptor's clip exactly: a command held there is 600 on the wire,
+      # the one nonzero value it may sit still on.
+      self.STEER_RAIL_SCHEDULE = ([0.], [ti.STEER_MAX / ti.STEER_SCALE])
+      self.STEER_SLEW_SCHEDULE = ([0.], [ti.STEER_DELTA_UP / ti.STEER_SCALE], [ti.STEER_DELTA_DOWN / ti.STEER_SCALE])
+      # The speed-binned seeds were learned on the EPS command alone, most behind steer-to-zero
+      # firmware. With the interceptor adding its share the car learns its own from the default
+      # bins, under a seed version of its own so neither plant restores the other's cache.
+      self.SPEED_DEP_CONFIG = {'seed_version': ti.SPEED_DEP_SEED_VERSION}
+
+
+class TorqueInterceptorParams:
+  """The MoreTorque Torque Interceptor (TI): limits for its own command, CAM_LKAS2 on bus 1.
+
+  The TI sits between the column torque sensor and the EPS and biases the signal the EPS
+  reads, so the EPS's own power assist steers at any speed, the legacy firmware's 45 kph floor
+  included. mazda.h's MAZDA_TI_STEERING_LIMITS enforces the same numbers in the panda and the
+  safety tests take theirs from here. Protocol and violation codes: the TI's published safety
+  documentation (docs/zoompilot/mazda-torque-interceptor.md).
+  """
+  # The TI clips the request at 600 itself. It also latches VIOL_LKAS_STUK for 30 s on a request
+  # that sits still anywhere other than 0 or +-600, so nothing may plateau below this: the
+  # controller's rail (lateral_tune.get_steer_rail_schedule) lands exactly on it.
+  STEER_MAX = 600
+  # The TI author's rates; its firmware ramps the bias down by itself on a faster rise.
+  STEER_DELTA_UP = 6              # torque increase per refresh
+  STEER_DELTA_DOWN = 15           # torque decrease per refresh
+  STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
+  STEER_DRIVER_MULTIPLIER = 40    # weight driver torque
+  STEER_DRIVER_FACTOR = 1
+  # 100 Hz, engaged or not: a gap in the stream over 100 ms is the TI's VIOL_CAN_TMO.
+  STEER_STEP = 1
+  # Frames a request may sit on one value, other than 0 and the clip, before it is moved a count.
+  STEER_HELD_FRAMES = 25
+
+  # Counts per unit of normalized torque. The EPS command is u x EPS_STEER_MAX and the tune is on
+  # that scale (TUNE_SCALE x upstream's), so the TI's share keeps upstream's ratio to it: the
+  # 800:600 the TI was developed and driven on.
+  STEER_SCALE = round(STEER_MAX * CarControllerParams.TUNE_SCALE)
+
+  # steeringPressed on the TI's reading of the real sensor (the EPS's own is the biased signal).
+  STEER_THRESHOLD = 6
+  STEER_PRESSED_FRAMES = 5
+  STEER_OVERRIDE_NOW = 20         # above this, pressed at once: no need to out-wait the filter
+
+  # No request below this speed, and lateral is off below it (minSteerSpeed). Held still, the
+  # command stops moving and the TI reads a stuck sender; a stopped car needs no lateral
+  # authority either.
+  MIN_SPEED = 1.0                 # m/s
+
+  # TI_FEEDBACK is 50 Hz. Two frames may go missing; past that the TI no longer vouches for
+  # itself and its command returns to zero. Inside the panda's 100 ms
+  # (mazda.h's MAZDA_TI_FEEDBACK_TIMEOUT_US), so the controller stops before it is refused.
+  FEEDBACK_TIMEOUT = 0.06         # s
+  # Unfit this long while the car moves is a steer fault. Anything shorter costs its command
+  # for those frames and a ramp back, not the driver's lateral.
+  FAULT_T = 0.2                   # s
+  # Unfit, or silent under a running command stream, this long: the driver is told by name
+  # (CarState.ti_not_ready).
+  NOT_READY_ALERT_T = 2.0         # s
+  # From the first command frame it answers within one and is in RUN some 5 s later. Nothing
+  # is said about it before this.
+  BOOT_T = 8.0                    # s
+  # DRIVER_OVER is the TI stepping aside for a driver steering through it, not a fault. It may
+  # take this long to return to RUN once the wheel is let go.
+  DRIVER_OVER_RELEASE_T = 1.0     # s
+
+  # The speed-binned learner's cache version for a car steered through the interceptor.
+  SPEED_DEP_SEED_VERSION = 64
+
+
+class TorqueInterceptorState(IntEnum):
+  # TI_FEEDBACK.STATE. Only RUN applies the bias; the others are bypass (sensor straight to EPS).
+  DISCOVER = 0      # booted, waiting for the keyed command stream
+  OFF = 1           # start-up or recovery delay, or a latched violation
+  DRIVER_OVER = 2   # the driver is steering harder than the TI can pass: it steps aside
+  RUN = 3
+
 
 @dataclass
 class MazdaCarDocs(CarDocs):
@@ -155,6 +243,10 @@ class MazdaFlags(IntFlag):
   # it, older logs carry it.
   HAS_BSM = 32
 
+  # A Torque Interceptor is fitted and switched on (the TorqueInterceptorEnabled param, read in
+  # opendbc/sunnypilot/car/interfaces.py): it steers through the torque sensor at any speed.
+  TORQUE_INTERCEPTOR = 64
+
 
 class MazdaSafetyFlags(IntFlag):
   LONG = 1
@@ -162,6 +254,9 @@ class MazdaSafetyFlags(IntFlag):
   # 4 was the legacy-firmware copy of this bit until 2026-10: do not reuse it, an older car side
   # may still send it.
   EPS_HW = 2
+  # Admits the Torque Interceptor's command and feedback on bus 1 (mazda.h's MAZDA_PARAM_TI),
+  # and has the panda put that bus on the OBD-II pins, where the interceptor sits.
+  TORQUE_INTERCEPTOR = 8
 
 
 class WMI(StrEnum):

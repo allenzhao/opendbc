@@ -17,7 +17,7 @@ from opendbc.car.ford.values import FordFlags
 from opendbc.car.gm.values import GMFlags
 from opendbc.car.honda.values import HondaFlags
 from opendbc.car.hyundai.values import HyundaiFlags
-from opendbc.car.mazda.values import MazdaFlags
+from opendbc.car.mazda.values import MazdaFlags, MazdaSafetyFlags, TorqueInterceptorParams
 from opendbc.car.subaru.values import SubaruFlags
 from opendbc.car.toyota.values import ToyotaFlags
 from opendbc.car.volkswagen.values import VolkswagenFlags
@@ -211,3 +211,12 @@ def _initialize_mazda(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_
     if int(params_dict.get("MazdaTjaButton", 0)) == 1:
       CP_SP.flags |= MazdaFlagsSP.TJA_BUTTON.value
       CP_SP.safetyParam |= MazdaSafetyFlagsSP.TJA_BUTTON
+
+    # A Torque Interceptor answers only once it is spoken to, so the fingerprint cannot find it
+    # and the driver declares it. It steers through the torque sensor at any speed, which lifts
+    # the legacy firmware's floor to the speed below which it is sent nothing.
+    # Set before the interface is built: the parsers and the controller read the flag once.
+    if int(params_dict.get("TorqueInterceptorEnabled", 0)) == 1 and CP.flags & MazdaFlags.GEN1:
+      CP.flags |= MazdaFlags.TORQUE_INTERCEPTOR.value
+      CP.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.TORQUE_INTERCEPTOR.value
+      CP.minSteerSpeed = min(CP.minSteerSpeed, TorqueInterceptorParams.MIN_SPEED)

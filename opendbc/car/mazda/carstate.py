@@ -3,7 +3,8 @@ from opendbc.car import Bus, DT_CTRL, create_button_events, structs, uds
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.mazda.radar_session import RadarSessionManager
-from opendbc.car.mazda.values import DBC, LKAS_LIMITS, CarControllerParams, MazdaFlags
+from opendbc.car.mazda.values import DBC, LKAS_LIMITS, CarControllerParams, MazdaFlags, TorqueInterceptorParams, \
+  TorqueInterceptorState
 from opendbc.sunnypilot.car.mazda.carstate_ext import CarStateExt
 from opendbc.sunnypilot.car.mazda.mads import MadsCarState
 from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
@@ -17,6 +18,11 @@ STOCK_RADAR_ACK_GUARD_FRAMES = round(CarControllerParams.STOCK_RADAR_ACK_GUARD_T
 CAM_LANEINFO_FRESH_FRAMES = int(CarControllerParams.CAM_LANEINFO_FRESH_T / DT_CTRL)
 LKAS_REARM_FRAMES = round(CarControllerParams.LKAS_REARM_T / DT_CTRL)
 LKAS_REARM_FAULT_FRAMES = round(CarControllerParams.LKAS_REARM_FAULT_T / DT_CTRL)
+TI_FEEDBACK_FRESH_FRAMES = round(TorqueInterceptorParams.FEEDBACK_TIMEOUT / DT_CTRL)
+TI_FAULT_FRAMES = round(TorqueInterceptorParams.FAULT_T / DT_CTRL)
+TI_NOT_READY_ALERT_FRAMES = round(TorqueInterceptorParams.NOT_READY_ALERT_T / DT_CTRL)
+TI_BOOT_FRAMES = round(TorqueInterceptorParams.BOOT_T / DT_CTRL)
+TI_DRIVER_OVER_RELEASE_FRAMES = round(TorqueInterceptorParams.DRIVER_OVER_RELEASE_T / DT_CTRL)
 # Bus witnesses: vehicle messages whose silence means the bus is gone, not the radar, over the
 # CANParser's own ten-period validity window. {message: (signal, fresh frames)}
 MAIN_CAN_WITNESSES = {"PEDALS": ("ACC_ACTIVE", round(0.2 / DT_CTRL)), "ENGINE_DATA": ("SPEED", round(0.1 / DT_CTRL))}
@@ -73,6 +79,30 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     # The camera's high-beam request (0x440 BIT2), relayed to CRZ_CTRL by the stock radar and, under
     # the takeover, by the controller (docs/zoompilot/mazda-longitudinal.md, "High-beam relay").
     self.hbc_request = False
+
+    # Torque Interceptor (docs/zoompilot/mazda-torque-interceptor.md). ti_ready: fresh, well-formed
+    # feedback reporting RUN with no violation, error or ramp-down, which is the panda's
+    # condition for letting its torque through (mazda.h's mazda_get_quality_flag_valid).
+    self.ti_enabled = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
+    self.ti_ready = False
+    self.ti_fresh = False
+    self.ti_feedback_seen = False
+    self.ti_feedback_silent_frames = TI_FEEDBACK_FRESH_FRAMES
+    self.ti_version = 0
+    self.ti_state = int(TorqueInterceptorState.DISCOVER)
+    self.ti_violation = 0
+    self.ti_error = 0
+    # Our CAM_LKAS2 frames the panda refused since the last cycle (src 193, bus 1 + 0xC0).
+    self.ti_rejected = False
+    # Frames the controller has streamed the TI's command; the TI answers within one.
+    self.ti_stream_frames = 0
+    # Frames in a row the TI has been unfit with nothing to excuse it (update_torque_interceptor_fault),
+    # and since the driver last held the wheel.
+    self.ti_unfit_frames = 0
+    self.ti_unpressed_frames = TI_DRIVER_OVER_RELEASE_FRAMES
+    # Unfit for NOT_READY_ALERT_T: card publishes it as CarStateZP.torqueInterceptorNotReady and
+    # the driver is told by name.
+    self.ti_not_ready = False
 
     self.distance_button = 0
     # The wheel's second distance button (farther). Upstream has one gapAdjustCruise type that
@@ -175,6 +205,51 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
           self.lkas_block_origin_speed >= self.params.STEER_UNDELIVERED_ALERT_ORIGIN_SPEED):
         self.steer_undelivered_alert = True
 
+  def update_torque_interceptor(self, can_parsers) -> float:
+    """Read TI_FEEDBACK: whether the interceptor is fit, and the driver torque it carries."""
+    cp_ti = can_parsers[Bus.body]
+    feedback = cp_ti.vl["TI_FEEDBACK"]
+    if len(cp_ti.vl_all["TI_FEEDBACK"]["STATE"]) > 0:
+      self.ti_feedback_seen = True
+      self.ti_feedback_silent_frames = 0
+    else:
+      self.ti_feedback_silent_frames = min(self.ti_feedback_silent_frames + 1, TI_FEEDBACK_FRESH_FRAMES)
+    fresh = self.ti_fresh = self.ti_feedback_seen and self.ti_feedback_silent_frames < TI_FEEDBACK_FRESH_FRAMES
+
+    self.ti_version = int(feedback["VERSION_NUMBER"])
+    self.ti_state = int(feedback["STATE"])
+    self.ti_violation = int(feedback["VIOL"])
+    self.ti_error = int(feedback["ERROR"])
+    # The torque byte is sent twice in place of a checksum; every firmware reports a version.
+    well_formed = feedback["TI_TORQUE_SENSOR"] == feedback["CHKSUM"] and self.ti_version != 0
+    # Ramping its bias down by itself, the TI ignores the request until that reads zero.
+    # Firmware version 1 has no such byte.
+    ramp_down = self.ti_version > 1 and feedback["RAMP_DOWN"] != 0
+    self.ti_ready = (fresh and well_formed and self.ti_state == TorqueInterceptorState.RUN and
+                     self.ti_violation == 0 and self.ti_error == 0 and not ramp_down)
+    self.ti_rejected = len(can_parsers[Bus.alt].vl_all["CAM_LKAS2"]["LKAS_REQUEST"]) > 0
+    return feedback["TI_TORQUE_SENSOR"]
+
+  def update_torque_interceptor_fault(self, v_ego_raw: float, steering_pressed: bool) -> bool:
+    """Whether an unfit interceptor is a steer fault this frame; also keeps ti_not_ready.
+
+    Its command is zero on the first unfit frame regardless (the controller). This decides
+    when that costs the driver lateral and when the interceptor is named to them.
+    """
+    self.ti_unpressed_frames = 0 if steering_pressed else min(self.ti_unpressed_frames + 1, TI_DRIVER_OVER_RELEASE_FRAMES)
+    # Stepping aside for a driver who is steering through it is the interceptor working.
+    driver_over = (self.ti_fresh and self.ti_state == TorqueInterceptorState.DRIVER_OVER and
+                   self.ti_unpressed_frames < TI_DRIVER_OVER_RELEASE_FRAMES)
+    # Stopped, it is sent nothing and may sit out the stop in its own time. Silent, it is
+    # unplugged, unpowered, or bus 1 is not on the OBD-II pins: that is wrong at any speed, once
+    # the command stream it answers to is up.
+    moving = v_ego_raw >= TorqueInterceptorParams.MIN_SPEED
+    silent = not self.ti_fresh and self.ti_stream_frames > 0
+    unfit = not self.ti_ready and not driver_over and (moving or silent)
+    self.ti_unfit_frames = min(self.ti_unfit_frames + 1, TI_NOT_READY_ALERT_FRAMES) if unfit else 0
+    self.ti_not_ready = self.ti_unfit_frames >= TI_NOT_READY_ALERT_FRAMES and self.ti_stream_frames >= TI_BOOT_FRAMES
+    return moving and self.ti_unfit_frames > TI_FAULT_FRAMES
+
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
@@ -205,7 +280,17 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
 
     ret.steeringAngleDeg = cp.vl["STEER"]["STEER_ANGLE"]
     ret.steeringTorque = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]
-    ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > LKAS_LIMITS.STEER_THRESHOLD, 5)
+    steer_threshold, steer_pressed_frames = LKAS_LIMITS.STEER_THRESHOLD, 5
+    if self.ti_enabled:
+      # The interceptor biases the signal the EPS reports above, so the driver's torque is its
+      # own reading of the sensor. Silent, it is in bypass and the EPS's reading is the driver's.
+      ti_torque = self.update_torque_interceptor(can_parsers)
+      if self.ti_fresh:
+        ret.steeringTorque = ti_torque
+        steer_threshold, steer_pressed_frames = TorqueInterceptorParams.STEER_THRESHOLD, TorqueInterceptorParams.STEER_PRESSED_FRAMES
+        if abs(ti_torque) > TorqueInterceptorParams.STEER_OVERRIDE_NOW:
+          self.steering_pressed_cnt = steer_pressed_frames * 2 + 1
+    ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > steer_threshold, steer_pressed_frames)
 
     ret.steeringTorqueEps = cp.vl["STEER_TORQUE"]["STEER_TORQUE_MOTOR"]
     ret.steeringRateDeg = cp.vl["STEER_RATE"]["STEER_ANGLE_RATE"]
@@ -345,7 +430,8 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
       self.lkas_setting_on = any(cp_cam.vl["CAM_SETTINGS"][s] for s in ("LKAS_INERVENTION_ON1", "ILKAS_NTERVENTION_ON2"))
     camera_faulted = cp_cam.vl["CAM_LANEINFO"]["ERR_BIT"] == 1 or cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1
     las_off = cam_laneinfo_fresh and cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0 and not camera_faulted
-    ret.invalidLkasSetting = las_off or not self.lkas_setting_on
+    # The interceptor steers through the torque sensor whatever the car's lane keep is set to.
+    ret.invalidLkasSetting = (las_off or not self.lkas_setting_on) and not self.ti_enabled
     self.update_lkas_arming(ret.invalidLkasSetting)
     self.lkas_setting_invalid = ret.invalidLkasSetting
 
@@ -354,12 +440,17 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
         self.low_speed_alert = True
       else:
         self.low_speed_alert = False
-    ret.lowSpeedAlert = self.low_speed_alert
+    # With a Torque Interceptor lateral carries on below the EPS's floor: nothing to warn of.
+    ret.lowSpeedAlert = self.low_speed_alert and not self.ti_enabled
 
     # Check if LKAS is disabled due to lack of driver torque when all other states indicate
     # it should be enabled (steer lockout). Don't warn until we actually get lkas active
     # and lose it again, i.e, after initial lkas activation
-    if not self.CP.flags & MazdaFlags.STEER_TO_ZERO_EPS:
+    if self.ti_enabled:
+      # The interceptor is the actuator at every speed, so the EPS's own LKAS block (its floor,
+      # its hands-off lockout) is no fault while the interceptor is fit.
+      ret.steerFaultTemporary = self.update_torque_interceptor_fault(ret.vEgoRaw, ret.steeringPressed)
+    elif not self.CP.flags & MazdaFlags.STEER_TO_ZERO_EPS:
       ret.steerFaultTemporary = self.lkas_allowed_speed and lkas_blocked
     else:
       # Report only sustained road-speed zero delivery after the command has been suppressed.
@@ -377,7 +468,8 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     # camera signals
     self.cam_lkas = cp_cam.vl["CAM_LKAS"]
     self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
-    ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1
+    # A faulted camera takes the EPS's LKAS with it, not the interceptor.
+    ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 and not self.ti_enabled
     self.hbc_request = cam_laneinfo_fresh and self.cam_laneinfo["BIT2"] == 1
 
     # Decode distance, set-speed, resume, cancel, and main-button events.
@@ -436,10 +528,17 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
       ("CAM_EMPTY", float("nan")),
       ("CAM_PEDESTRIAN", float("nan")),
     ]
-    return {
+    parsers = {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, 0),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_messages, 2),
       # Our own 0x243 frames the panda refused, reported back with src = bus + 0xC0. Sporadic by
       # nature, so never part of canValid or canTimeout.
       Bus.loopback: CANParser(DBC[CP.carFingerprint][Bus.pt], [("CAM_LKAS", float("nan"))], 192),
     }
+    if CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      # The interceptor's side channel. Its freshness is judged in update_torque_interceptor:
+      # an accessory going quiet must not read as the vehicle's CAN going invalid.
+      parsers[Bus.body] = CANParser(DBC[CP.carFingerprint][Bus.pt], [("TI_FEEDBACK", float("nan"))], 1)
+      # Its command as the panda refused it, src = bus 1 + 0xC0.
+      parsers[Bus.alt] = CANParser(DBC[CP.carFingerprint][Bus.pt], [("CAM_LKAS2", float("nan"))], 193)
+    return parsers

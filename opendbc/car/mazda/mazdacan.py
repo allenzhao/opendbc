@@ -140,6 +140,24 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
   return packer.make_can_msg("CAM_LKAS", 0, values)
 
 
+# The Torque Interceptor's side channel: the OBD-II CAN pair that Comma Power carries, which the
+# panda reaches as bus 1 once it multiplexes CAN2 onto the OBD pins.
+TI_BUS = 1
+# The TI's 3-byte discovery key 0xC461CE and the option byte 0x60, "normal run". The other
+# options (0x61 cold reset, which clears latched violations, and 0x62 forced bypass) are never
+# sent, and the panda refuses them.
+TI_KEY = 0xC461CE60
+
+
+def create_ti_steering_control(packer, apply_torque):
+  # CHKSUM is the request sent twice, not a checksum; the TI compares the two copies.
+  return packer.make_can_msg("CAM_LKAS2", TI_BUS, {
+    "LKAS_REQUEST": apply_torque,
+    "CHKSUM": apply_torque,
+    "KEY": TI_KEY,
+  })
+
+
 def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool):
   # Preserve camera LKAS state. Keep TJA modes clear because its state machine does not own
   # the injected steering command.

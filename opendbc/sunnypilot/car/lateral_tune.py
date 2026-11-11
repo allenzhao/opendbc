@@ -56,8 +56,14 @@ def get_steer_rail_schedule(CP):
   by speed: EPS_CEILING_LOOKUP / STEER_MAX, clipped to 1.0. None when the brand declares no
   ceiling (the EPS delivers the full scale everywhere). Lets a lateral controller treat
   reaching the measured rail as actuator saturation instead of comparing against a
-  full-scale command it can never deliver above the ceiling's falloff."""
+  full-scale command it can never deliver above the ceiling's falloff.
+
+  A brand whose reported actuator is not the EPS command (Mazda's Torque Interceptor) declares
+  the rail itself, as STEER_RAIL_SCHEDULE."""
   ccp = _controller_params(CP)
+  declared = getattr(ccp, 'STEER_RAIL_SCHEDULE', None)
+  if declared is not None:
+    return [float(x) for x in declared[0]], [min(1.0, float(x)) for x in declared[1]]
   ceiling = getattr(ccp, 'EPS_CEILING_LOOKUP', None)
   if ceiling is None:
     return None
@@ -71,8 +77,14 @@ def get_steer_slew_schedule(CP):
   single breakpoint otherwise. Lets controlsd's steer-limit classifier tell a command the
   actuator is still walking toward (one slew step behind) from one the driver envelope or
   the EPS rail is holding back. None when the brand's CarControllerParams lacks the
-  attributes or cannot be built from CP (the consumer keeps upstream's flag as is)."""
+  attributes or cannot be built from CP (the consumer keeps upstream's flag as is).
+
+  A brand whose reported actuator is not the EPS command declares the schedule itself, as
+  STEER_SLEW_SCHEDULE."""
   ccp = _controller_params(CP)
+  declared = getattr(ccp, 'STEER_SLEW_SCHEDULE', None)
+  if declared is not None:
+    return [float(x) for x in declared[0]], [float(x) for x in declared[1]], [float(x) for x in declared[2]]
   delta_up = getattr(ccp, 'STEER_DELTA_UP', None)
   delta_down = getattr(ccp, 'STEER_DELTA_DOWN', None)
   if delta_up is None or delta_down is None:
@@ -97,7 +109,14 @@ def get_speed_dep_config_for_car(CP):
   minSteerSpeed == 0 is the brand-neutral statement that the EPS steers to a stop, which is
   what the entry requires. An entry that stays active for a car with a floor loses the bins
   centered below it, and 'min_speed' keeps the first remaining bin's lower edge where the
-  full table puts it rather than widening that bin down to the default floor."""
+  full table puts it rather than widening that bin down to the default floor.
+
+  A car whose actuator is not the one the tables were learned on (Mazda's Torque Interceptor)
+  declares its own entry, as SPEED_DEP_CONFIG on its CarControllerParams, and takes none of the
+  platform's: it learns from the default bins under a seed version of its own."""
+  declared = getattr(_controller_params(CP), 'SPEED_DEP_CONFIG', None)
+  if declared is not None:
+    return dict(declared)
   cfg = get_speed_dep_config().get(CP.carFingerprint, {})
   if cfg.get('requires_steer_to_zero') and CP.minSteerSpeed > 0:
     return {}

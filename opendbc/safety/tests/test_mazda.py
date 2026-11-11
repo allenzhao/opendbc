@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import unittest
 
-from opendbc.car.mazda.values import CarControllerParams, MazdaSafetyFlags
+from opendbc.car.mazda.values import CarControllerParams, MazdaSafetyFlags, TorqueInterceptorParams, TorqueInterceptorState
 from opendbc.car.structs import CarParams
 from opendbc.sunnypilot.car.mazda.values import MazdaSafetyFlagsSP
 from opendbc.safety.tests.libsafety import libsafety_py
@@ -733,6 +733,533 @@ class TestMazdaMrccOffCleanup(MazdaTjaButtonBase):
     self.safety.safety_rx_hook(self._crz_ctrl(True))
     msg = self.packer.make_can_msg_safety("CRZ_BTNS", 0, {"TJA_BUTTON": 1})
     self.assertFalse(self.safety.safety_tx_hook(msg))
+
+
+TI = TorqueInterceptorParams
+TI_LKAS = 0x249
+TI_FEEDBACK = 0x24A
+TI_BUS = 1
+TI_SAFETY_PARAM = MazdaSafetyFlags.EPS_HW | MazdaSafetyFlags.TORQUE_INTERCEPTOR
+TI_FEEDBACK_TIMEOUT_US = 100_000  # mazda.h's MAZDA_TI_FEEDBACK_TIMEOUT_US
+TI_MAX_RT_DELTA = 192             # mazda.h's MAZDA_TI_STEERING_LIMITS.max_rt_delta
+FRAME_US = 10_000                 # the controller's 100 Hz
+TI_KEY = bytes.fromhex("c461ce60")  # the interceptor's 3-byte key and the option byte, normal run
+
+
+def ti_feedback_msg(torque=0, version=0x10, state=TorqueInterceptorState.RUN, viol=0, error=0, ramp=0, copy=None, bus=TI_BUS):
+  """TI_FEEDBACK as the interceptor sends it; the healthy idle frame is 7F 7F 10 03 00 00 00 30."""
+  byte0 = (int(torque) + 127) & 0xFF
+  return make_msg(bus, TI_FEEDBACK, 8, bytes([byte0, byte0 if copy is None else copy, version, int(state), viol, error, ramp, 0x30]))
+
+
+def ti_cmd_msg(torque, copy=None, key=TI_KEY, bus=TI_BUS, nibbles=(0, 0)):
+  """CAM_LKAS2: the 12-bit request and its copy, the interceptor's key and the run option."""
+  request = int(torque) + 2048
+  request_copy = request if copy is None else int(copy) + 2048
+  dat = bytes([(nibbles[0] << 4) | (request >> 8), request & 0xFF, (nibbles[1] << 4) | (request_copy >> 8), request_copy & 0xFF])
+  return make_msg(bus, TI_LKAS, 8, dat + key)
+
+
+class MazdaTorqueInterceptorMixin:
+  """The interceptor admitted: its command joins the TX list, it is never relayed between the car
+  and the camera, and the driver's torque is its reading, not the EPS's biased one."""
+
+  FWD_BLACKLISTED_ADDRS = {0: [TI_LKAS], 2: [TI_LKAS]}
+
+  def _torque_driver_msg(self, torque):
+    return ti_feedback_msg(torque)
+
+  def test_the_eps_reading_is_not_the_drivers_torque(self):
+    for torque in (50, -50, 30):
+      self.assertTrue(self._rx(self.packer.make_can_msg_safety("STEER_TORQUE", 0, {"STEER_TORQUE_SENSOR": torque})))
+    self.assertEqual(0, self.safety.get_torque_driver_min())
+    self.assertEqual(0, self.safety.get_torque_driver_max())
+
+  def test_interceptor_feedback_on_another_bus_is_not_sampled(self):
+    for bus in (0, 2):
+      self._rx(ti_feedback_msg(40, bus=bus))
+    self.assertEqual(0, self.safety.get_torque_driver_max())
+
+  def test_interceptor_idle_stream_is_always_admitted(self):
+    for controls_allowed in (False, True):
+      self.safety.set_controls_allowed(controls_allowed)
+      self.assertTrue(self._tx(ti_cmd_msg(0)))
+
+
+class TestMazdaTorqueInterceptorEpsSafety(MazdaTorqueInterceptorMixin, TestMazdaEpsSafety):
+  """Every test of the EPS command again with the interceptor admitted: 0x243 keeps its
+  envelope, limited against the driver torque the interceptor reports."""
+
+  TX_MSGS = [[0x243, 0], [0x09d, 0], [0x440, 0], [TI_LKAS, TI_BUS]]
+  SAFETY_PARAM = TI_SAFETY_PARAM
+
+
+class TestMazdaTorqueInterceptorLongitudinalSafety(MazdaTorqueInterceptorMixin, TestMazdaLongitudinalSafety):
+  """And under openpilot longitudinal: the fourth RX/TX pair mazda_init selects."""
+
+  TX_MSGS = [*TestMazdaLongitudinalSafety.TX_MSGS, [TI_LKAS, TI_BUS]]
+  SAFETY_PARAM = MazdaSafetyFlags.LONG | TI_SAFETY_PARAM
+
+
+class TestMazdaTorqueInterceptorCommand(unittest.TestCase):
+  """The interceptor's own command, CAM_LKAS2 on bus 1. Torque needs openpilot steering and an
+  interceptor that reports itself fit within the last 100 ms; inside that it is held to
+  values' TorqueInterceptorParams on a history of its own. Everything else is refused, and
+  what is not torque (the idle frame) is always admitted, because the interceptor faults on a
+  gap in the stream."""
+
+  SAFETY_PARAM = TI_SAFETY_PARAM
+
+  def setUp(self):
+    self.packer = CANPackerSafety("mazda_2017")
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, self.SAFETY_PARAM)
+    self.safety.init_tests()
+    self.t = 1_000_000
+    self.safety.set_timer(self.t)
+    self.safety.set_controls_allowed(True)
+    self._hear()
+
+  def _advance(self, us):
+    self.t += us
+    self.safety.set_timer(self.t)
+
+  def _hear(self, **feedback):
+    return self.safety.safety_rx_hook(ti_feedback_msg(**feedback))
+
+  def _tx(self, torque, **cmd):
+    return self.safety.safety_tx_hook(ti_cmd_msg(torque, **cmd))
+
+  def _frame(self, torque, driver=0):
+    """One 10 ms control frame with a fit interceptor reporting the driver torque given."""
+    self._advance(FRAME_US)
+    self._hear(torque=driver)
+    return self._tx(torque)
+
+  def _ramp(self, target, driver=0):
+    """Walk the command to target inside the rate limits; every frame must be admitted."""
+    torque = 0
+    while torque != target:
+      step = TI.STEER_DELTA_UP if abs(target) > abs(torque) else TI.STEER_DELTA_DOWN
+      torque = max(torque - step, target) if target < torque else min(torque + step, target)
+      self.assertTrue(self._frame(torque, driver), torque)
+
+  # *** the numbers are the controller's ***
+
+  def test_limits_are_the_controllers(self):
+    self.assertEqual((600, 6, 15, 15, 40), (TI.STEER_MAX, TI.STEER_DELTA_UP, TI.STEER_DELTA_DOWN,
+                                            TI.STEER_DRIVER_ALLOWANCE, TI.STEER_DRIVER_MULTIPLIER))
+    self.assertLess(TI.FEEDBACK_TIMEOUT * 1e6, TI_FEEDBACK_TIMEOUT_US)
+    # at the controller's rate a quarter second of ramp stays inside the realtime limit
+    self.assertLess(TI.STEER_DELTA_UP * 25, TI_MAX_RT_DELTA)
+
+  # *** who may send torque ***
+
+  def test_torque_needs_openpilot_steering(self):
+    # lateral is its own axis under MADS; with MADS off it follows cruise, as for 0x243
+    for mads in (False, True):
+      self.safety.set_mads_params(mads, False, False)
+      for controls_allowed, controls_allowed_lateral in [(False, False), (True, False), (False, True), (True, True)]:
+        steering = controls_allowed_lateral or (controls_allowed and not mads)
+        self._advance(FRAME_US)
+        self._hear()
+        # set after the RX hook, which runs the MADS state machine
+        self.safety.set_controls_allowed(controls_allowed)
+        self.safety.set_controls_allowed_lateral(controls_allowed_lateral)
+        self.assertTrue(self._tx(0))
+        for torque in (TI.STEER_DELTA_UP, -TI.STEER_DELTA_UP, 1, -1):
+          self._tx(0)  # history back to zero
+          self.assertEqual(steering, self._tx(torque), f"{mads=} {controls_allowed=} {controls_allowed_lateral=} {torque=}")
+    self.safety.set_mads_params(False, False, False)
+    self.safety.set_controls_allowed_lateral(False)
+
+  def test_idle_frame_is_admitted_whatever_the_state(self):
+    for controls_allowed in (False, True):
+      for feedback in (None, {}, dict(state=TorqueInterceptorState.OFF, viol=0x12), dict(state=TorqueInterceptorState.DRIVER_OVER)):
+        self.safety.set_controls_allowed(controls_allowed)
+        self._advance(FRAME_US)
+        if feedback is None:
+          self._advance(TI_FEEDBACK_TIMEOUT_US * 2)
+        else:
+          self._hear(**feedback)
+        self.assertTrue(self._tx(0), f"{controls_allowed=} {feedback=}")
+
+  def test_without_the_bit_the_command_is_refused_outright(self):
+    for param in (0, MazdaSafetyFlags.EPS_HW, MazdaSafetyFlags.LONG | MazdaSafetyFlags.EPS_HW):
+      self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, param)
+      self.safety.init_tests()
+      self.safety.set_controls_allowed(True)
+      self._hear()
+      for torque in (0, TI.STEER_DELTA_UP):
+        self.assertFalse(self._tx(torque), f"{param=} {torque=}")
+      # and its feedback is neither required nor sampled
+      self.assertEqual(0, self.safety.get_torque_driver_max())
+      self._hear(torque=40)
+      self.assertEqual(0, self.safety.get_torque_driver_max())
+
+  def test_only_on_bus_1(self):
+    for bus in (0, 2, 3):
+      self.assertFalse(self._tx(0, bus=bus))
+    self.assertTrue(self._tx(0))
+
+  # *** the frame itself ***
+
+  def test_key_and_option_byte(self):
+    key = TI_KEY
+    self.assertTrue(self._tx(0, key=key))
+    for i in range(4):
+      for bit in range(8):
+        bad = bytearray(key)
+        bad[i] ^= 1 << bit
+        self.assertFalse(self._tx(0, key=bytes(bad)), bad.hex())
+    # 0x61 cold-resets the interceptor and clears its latched violations, 0x62 forces bypass
+    for option in (0x00, 0x61, 0x62, 0xFF):
+      self.assertFalse(self._tx(0, key=key[:3] + bytes([option])))
+    self.assertFalse(self._tx(0, key=bytes(4)))
+
+  def test_request_and_copy_must_agree(self):
+    self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+    for torque, copy in ((0, 1), (1, 0), (TI.STEER_DELTA_UP, -TI.STEER_DELTA_UP), (0, -2048), (3, 2)):
+      self._tx(0)
+      self.assertFalse(self._tx(torque, copy=copy), f"{torque=} {copy=}")
+
+  def test_high_nibbles_must_be_clear(self):
+    for nibbles in ((1, 0), (0, 1), (8, 0), (0, 8), (0xF, 0xF)):
+      self.assertFalse(self._tx(0, nibbles=nibbles), nibbles)
+    self.assertTrue(self._tx(0))
+
+  def test_a_malformed_frame_resets_the_history(self):
+    self._ramp(120)
+    self.assertFalse(self._tx(126, key=bytes(4)))
+    self.assertFalse(self._frame(126))
+    self.assertTrue(self._frame(TI.STEER_DELTA_UP))
+
+  def test_wrong_length_is_refused(self):
+    self.assertFalse(self.safety.safety_tx_hook(make_msg(TI_BUS, TI_LKAS, 4, bytes.fromhex("08000800"))))
+
+  # *** the envelope ***
+
+  def test_max_torque(self):
+    for sign in (1, -1):
+      self._ramp(sign * TI.STEER_MAX)
+      self.assertTrue(self._frame(sign * TI.STEER_MAX))
+      self.assertFalse(self._frame(sign * (TI.STEER_MAX + 1)))
+      self._ramp(0)
+
+  def test_rate_up(self):
+    for sign in (1, -1):
+      for start in (0, 60, 300):
+        self._tx(0)
+        self._ramp(sign * start)
+        self.assertTrue(self._frame(sign * (start + TI.STEER_DELTA_UP)), f"{sign=} {start=}")
+        self._tx(0)
+        self._ramp(sign * start)
+        self.assertFalse(self._frame(sign * (start + TI.STEER_DELTA_UP + 1)), f"{sign=} {start=}")
+      self._tx(0)
+
+  def test_falling_and_crossing_zero(self):
+    for sign in (1, -1):
+      # any fall toward zero is fine, in one frame if need be
+      for target in (299, 150, 0):
+        self._ramp(sign * 300)
+        self.assertTrue(self._frame(sign * target), target)
+        self._ramp(0)
+      # through zero, no further than one rise the other way
+      self._ramp(sign * 300)
+      self.assertTrue(self._frame(-sign * TI.STEER_DELTA_UP))
+      self._ramp(0)
+      self._ramp(sign * 300)
+      self.assertFalse(self._frame(-sign * (TI.STEER_DELTA_UP + 1)))
+      self._tx(0)
+
+  def test_against_the_driver(self):
+    allowance, multiplier = TI.STEER_DRIVER_ALLOWANCE, TI.STEER_DRIVER_MULTIPLIER
+    for sign in (1, -1):
+      # the full command survives opposing torque up to the allowance and not a count more
+      for driver in (0, allowance - 1, allowance, allowance + 1, allowance * 2):
+        self._ramp(sign * TI.STEER_MAX)
+        self._hold_driver(-sign * driver)
+        self.assertEqual(driver <= allowance, self._tx(sign * TI.STEER_MAX), f"{sign=} {driver=}")
+        self._tx(0)
+        self._hold_driver(0)
+
+      # 40 counts of command for every count past the allowance
+      for excess in (1, 5, 10):
+        limit = TI.STEER_MAX - excess * multiplier
+        for torque, admitted in ((limit, True), (limit + 1, False)):
+          self._ramp(sign * torque)
+          self._hold_driver(-sign * (allowance + excess))
+          self.assertEqual(admitted, self._tx(sign * torque), f"{sign=} {excess=} {torque=}")
+          self._tx(0)
+          self._hold_driver(0)
+
+      # well past it the command must come down by at least the down rate, and may by anything more
+      for torque, admitted in ((TI.STEER_MAX - TI.STEER_DELTA_DOWN, True), (TI.STEER_MAX - TI.STEER_DELTA_DOWN + 1, False), (0, True)):
+        self._ramp(sign * TI.STEER_MAX)
+        self._hold_driver(-sign * 80)
+        self.assertEqual(admitted, self._tx(sign * torque), f"{sign=} {torque=}")
+        self._tx(0)
+        self._hold_driver(0)
+
+      # torque with the command costs nothing
+      self._ramp(sign * TI.STEER_MAX)
+      self._hold_driver(sign * 80)
+      self.assertTrue(self._tx(sign * TI.STEER_MAX))
+      self._tx(0)
+      self._hold_driver(0)
+
+  def _hold_driver(self, torque):
+    for _ in range(common.MAX_SAMPLE_VALS):
+      self._hear(torque=torque)
+
+  def test_driver_torque_window(self):
+    for torque in (50, -50, *([0] * (common.MAX_SAMPLE_VALS - 2))):
+      self.assertTrue(self._hear(torque=torque))
+    self.assertEqual(-50, self.safety.get_torque_driver_min())
+    self.assertEqual(50, self.safety.get_torque_driver_max())
+    for _ in range(2):
+      self._hear()
+    self.assertEqual(0, self.safety.get_torque_driver_min())
+    self.assertEqual(0, self.safety.get_torque_driver_max())
+
+  def test_realtime_limit(self):
+    for sign in (1, -1):
+      self._tx(0)
+      self._advance(common.RT_INTERVAL + 1)
+      self._hear()
+      self.assertTrue(self._tx(0))  # the realtime reference lands on zero here
+      # frames faster than the controller sends them: the per-frame rate holds, the window does not
+      torque = 0
+      for _ in range(TI_MAX_RT_DELTA // TI.STEER_DELTA_UP):
+        torque += sign * TI.STEER_DELTA_UP
+        self.assertTrue(self._tx(torque), torque)
+      self.assertEqual(sign * TI_MAX_RT_DELTA, torque)
+      self.assertFalse(self._tx(torque + sign * TI.STEER_DELTA_UP))
+
+      # the same walk with the window rolling over on the way is admitted
+      self._advance(FRAME_US)
+      self._hear()
+      torque = 0
+      for i in range(TI_MAX_RT_DELTA // TI.STEER_DELTA_UP + 4):
+        if i == 20:
+          self._advance(common.RT_INTERVAL + 1)
+          self._hear()
+        torque += sign * TI.STEER_DELTA_UP
+        self.assertTrue(self._tx(torque), torque)
+      self._tx(0)
+
+  def test_realtime_window_is_a_quarter_second(self):
+    # the reference moves with the first frame more than RT_INTERVAL after the window opened
+    for past, rolled in ((0, False), (1, True)):
+      self.safety.set_controls_allowed(False)
+      self.assertTrue(self._tx(0))  # a window opens here, its reference at zero
+      self.safety.set_controls_allowed(True)
+      torque = 0
+      for _ in range(TI_MAX_RT_DELTA // TI.STEER_DELTA_UP):
+        torque += TI.STEER_DELTA_UP
+        self.assertTrue(self._tx(torque), torque)
+      self._advance(common.RT_INTERVAL + past)
+      self._hear()
+      self.assertTrue(self._tx(torque))
+      self.assertEqual(rolled, self._tx(torque + TI.STEER_DELTA_UP), past)
+      self._tx(0)
+
+  def test_a_refusal_restarts_the_ramp_from_zero(self):
+    for sign in (1, -1):
+      self._ramp(sign * 300)
+      self.assertFalse(self._frame(sign * (300 + TI.STEER_DELTA_UP + 1)))
+      self.assertFalse(self._frame(sign * (300 + TI.STEER_DELTA_UP)))
+      self.assertTrue(self._frame(sign * TI.STEER_DELTA_UP))
+      self._tx(0)
+
+  def test_losing_permission_restarts_the_ramp_from_zero(self):
+    self._ramp(300)
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._frame(0))
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._frame(300))
+    self.assertTrue(self._frame(TI.STEER_DELTA_UP))
+
+  def test_the_eps_commands_history_is_separate(self):
+    # a refusal on one command leaves the other's ramp alone
+    self._ramp(120)
+    self.safety.set_desired_torque_last(0)
+    eps = lambda torque: self.safety.safety_tx_hook(self.packer.make_can_msg_safety("CAM_LKAS", 0, {"LKAS_REQUEST": torque}))  # noqa: E731
+    self.assertFalse(eps(CarControllerParams.STEER_DELTA_UP + 1))
+    self.assertTrue(self._frame(120 + TI.STEER_DELTA_UP))
+    self.assertFalse(self._frame(120 + 3 * TI.STEER_DELTA_UP))
+    self.safety.set_desired_torque_last(0)
+    self.assertTrue(eps(CarControllerParams.STEER_DELTA_UP))
+
+  # *** the interceptor must vouch for itself ***
+
+  def test_torque_needs_a_fit_interceptor(self):
+    unfit = [dict(state=TorqueInterceptorState.DISCOVER), dict(state=TorqueInterceptorState.OFF),
+             dict(state=TorqueInterceptorState.OFF, viol=0x12), dict(state=TorqueInterceptorState.DRIVER_OVER),
+             dict(viol=1), dict(viol=0x11), dict(error=1), dict(error=0xFF), dict(ramp=1), dict(ramp=0xFF)]
+    for feedback in unfit:
+      self._advance(FRAME_US)
+      self._hear()
+      self._tx(0)
+      self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+      # these are ordinary states of a working interceptor: the frame is valid, controls stay
+      self.assertTrue(self._hear(**feedback), feedback)
+      self.assertTrue(self.safety.get_controls_allowed())
+      self.assertFalse(self._tx(TI.STEER_DELTA_UP), feedback)
+      self.assertTrue(self._tx(0))
+      # fit again, the ramp restarts from zero
+      self._hear()
+      self.assertFalse(self._tx(2 * TI.STEER_DELTA_UP + 1), feedback)
+      self.assertTrue(self._tx(TI.STEER_DELTA_UP), feedback)
+
+  def test_any_firmware_that_reports_a_version(self):
+    for version in (1, 2, 0x10, 0x11, 0xFF):
+      self._advance(FRAME_US)
+      self.assertTrue(self._hear(version=version))
+      self._tx(0)
+      self.assertTrue(self._tx(TI.STEER_DELTA_UP), version)
+
+  def test_firmware_version_1_has_no_ramp_byte(self):
+    self.assertTrue(self._hear(version=1, ramp=1))
+    self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+    self._tx(0)
+    self.assertTrue(self._hear(version=2, ramp=1))
+    self.assertFalse(self._tx(TI.STEER_DELTA_UP))
+
+  def test_a_malformed_feedback_frame_drops_controls(self):
+    malformed = [dict(version=0), dict(state=4), dict(state=0xFF), dict(torque=5, copy=0x7F), dict(torque=0, copy=0x80)]
+    for feedback in malformed:
+      self.safety.set_controls_allowed(True)
+      self._advance(FRAME_US)
+      self._hear(torque=7)
+      self.assertFalse(self._hear(**feedback), feedback)
+      self.assertFalse(self.safety.get_controls_allowed(), feedback)
+      # nor is its torque byte taken for the driver's
+      self.assertEqual(7, self.safety.get_torque_driver_max())
+      self.safety.set_controls_allowed(True)
+      self.assertFalse(self._tx(TI.STEER_DELTA_UP), feedback)
+      self.assertTrue(self._tx(0))
+
+  def test_feedback_must_be_fresh(self):
+    self._tx(0)
+    self._hear()
+    self._advance(TI_FEEDBACK_TIMEOUT_US)
+    self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+    self._tx(0)
+    self._advance(1)
+    self.assertFalse(self._tx(TI.STEER_DELTA_UP))
+    self.assertTrue(self._tx(0))
+    self._hear()
+    self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+
+  def test_a_stale_interceptor_stays_stale_until_heard_again(self):
+    # the microsecond timer wraps every 71 minutes: an old frame must not come back as a fresh one
+    self._hear()
+    self._advance(TI_FEEDBACK_TIMEOUT_US + 1)
+    self.assertFalse(self._tx(TI.STEER_DELTA_UP))
+    self._advance(-(TI_FEEDBACK_TIMEOUT_US // 2))
+    self.assertFalse(self._tx(TI.STEER_DELTA_UP))
+    self._hear()
+    self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+
+  def test_an_unfit_frame_does_not_refresh_the_last_fit_one(self):
+    self._hear()
+    self._advance(TI_FEEDBACK_TIMEOUT_US - FRAME_US)
+    self._hear(state=TorqueInterceptorState.OFF)
+    self.assertFalse(self._tx(TI.STEER_DELTA_UP))
+
+  def test_feedback_from_another_bus_does_not_count(self):
+    self._advance(TI_FEEDBACK_TIMEOUT_US + 1)
+    for bus in (0, 2):
+      self.safety.safety_rx_hook(ti_feedback_msg(bus=bus))
+    self.assertFalse(self._tx(TI.STEER_DELTA_UP))
+
+  def test_nothing_before_the_first_feedback(self):
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, self.SAFETY_PARAM)
+    self.safety.init_tests()
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(TI.STEER_DELTA_UP))
+    self.assertTrue(self._tx(0))
+
+  def test_a_new_safety_mode_forgets_the_interceptor(self):
+    self._ramp(120)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, self.SAFETY_PARAM)
+    self.safety.init_tests()
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(TI.STEER_DELTA_UP))
+    self._hear()
+    self.assertFalse(self._tx(120 + TI.STEER_DELTA_UP))
+    self.assertTrue(self._tx(TI.STEER_DELTA_UP))
+
+  # *** the RX check ***
+
+  def test_a_silent_interceptor_fails_the_rx_checks(self):
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, self.SAFETY_PARAM)
+    self.safety.init_tests()
+    self.safety.set_unseen_rx_checks_valid()
+    self.safety.set_controls_allowed(True)
+    self.safety.safety_tick()
+    self.assertTrue(self.safety.get_controls_allowed())
+    # a second and more without TI_FEEDBACK
+    self.t = 3_000_000
+    self.safety.set_timer(self.t)
+    for name in ("CRZ_CTRL", "CRZ_BTNS", "STEER_TORQUE", "ENGINE_DATA", "PEDALS"):
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety(name, 0, {}))
+    self.safety.set_controls_allowed(True)
+    self.safety.safety_tick()
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_safety_rx_checks_invalid())
+    # heard again
+    self._hear()
+    self.safety.safety_tick()
+    self.assertFalse(self.safety.get_safety_rx_checks_invalid())
+
+  def test_without_the_bit_the_interceptor_is_not_required(self):
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, MazdaSafetyFlags.EPS_HW)
+    self.safety.init_tests()
+    self.safety.set_timer(3_000_000)
+    for name in ("CRZ_CTRL", "CRZ_BTNS", "STEER_TORQUE", "ENGINE_DATA", "PEDALS"):
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety(name, 0, {}))
+    self.safety.safety_tick()
+    self.assertFalse(self.safety.get_safety_rx_checks_invalid())
+
+  # *** forwarding ***
+
+  def test_the_command_is_never_relayed(self):
+    for bus in (0, 2):
+      self.assertEqual(-1, self.safety.safety_fwd_hook(bus, TI_LKAS))
+    # the addresses beside it still are
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, TI_LKAS - 1))
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, TI_FEEDBACK))
+
+  def test_without_the_bit_forwarding_is_untouched(self):
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, MazdaSafetyFlags.EPS_HW)
+    self.safety.init_tests()
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, TI_LKAS))
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, TI_LKAS))
+
+
+class TestMazdaTorqueInterceptorCommandLongitudinal(TestMazdaTorqueInterceptorCommand):
+  """The same command under openpilot longitudinal."""
+
+  SAFETY_PARAM = MazdaSafetyFlags.LONG | TI_SAFETY_PARAM
+
+  def test_a_silent_interceptor_fails_the_rx_checks(self):
+    # CRZ_CTRL is not among this mode's checks; the rest is the same
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, self.SAFETY_PARAM)
+    self.safety.init_tests()
+    self.safety.set_timer(3_000_000)
+    for name in ("CRZ_BTNS", "STEER_TORQUE", "ENGINE_DATA", "PEDALS"):
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety(name, 0, {}))
+    self.safety.safety_tick()
+    self.assertTrue(self.safety.get_safety_rx_checks_invalid())
+    self.safety.safety_rx_hook(ti_feedback_msg())
+    self.safety.safety_tick()
+    self.assertFalse(self.safety.get_safety_rx_checks_invalid())
+
+  def test_torque_needs_openpilot_steering(self):
+    # openpilot longitudinal derives controls from PEDALS; set directly, the gate is the same
+    super().test_torque_needs_openpilot_steering()
 
 
 if __name__ == "__main__":
