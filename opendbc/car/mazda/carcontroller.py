@@ -69,7 +69,11 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.g46l = bool(CP.flags & MazdaFlags.G46L_RADAR)
     self.torque_interceptor = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
     self.ti_apply_torque_last = 0
+    # the stuck-request guard: frames inside the band, the band so far, and the dip under way
     self.ti_held_frames = 0
+    self.ti_held_lo = self.ti_held_hi = 0
+    self.ti_dip_cap = 0
+    self.ti_dip_frames = 0
     self.apply_torque_last = 0
     self.driver_torque_samples: deque[float] = deque(maxlen=self.params.STEER_DRIVER_SAMPLES)
     self.packer = CANPacker(dbc_names[Bus.pt])
@@ -220,6 +224,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       # without.
       self.ti_apply_torque_last = 0
       self.ti_held_frames = 0
+      self.ti_dip_frames = 0
       return 0
 
     new_torque = 0
@@ -234,15 +239,34 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       driver_torque = max(self.driver_torque_samples) + self.params.STEER_DRIVER_MARGIN
     apply_torque = apply_driver_steer_torque_limits(new_torque, self.ti_apply_torque_last, driver_torque, ti)
 
-    # The interceptor reads a request that sits still anywhere but 0 or its own clip as a stuck
-    # sender (VIOL_LKAS_STUK) and latches off for 30 s. A steady hand on the wheel pins the
-    # driver limit and a quiet road the controller's own output, so a request that has not
-    # moved for STEER_HELD_FRAMES is moved one count toward zero; the limits bring it back.
-    held = apply_torque == self.ti_apply_torque_last and 0 < abs(apply_torque) < ti.STEER_MAX
-    self.ti_held_frames = self.ti_held_frames + 1 if held else 0
-    if self.ti_held_frames >= ti.STEER_HELD_FRAMES:
-      apply_torque -= 1 if apply_torque > 0 else -1
+    # The interceptor reads a request that sits still as a stuck sender (VIOL_LKAS_STUK) and
+    # latches off for 30 s. A steady hand on the wheel pins the driver limit, a quiet road the
+    # controller's own output and a tight turn the clip, so a request that has stayed inside
+    # the band for STEER_HELD_FRAMES is held STEER_DIP nearer zero for STEER_DIP_FRAMES.
+    # Toward zero is always inside the limits, here and in the panda; the up rate brings it back.
+    if self.ti_dip_frames > 0:
+      apply_torque = int(np.clip(apply_torque, -self.ti_dip_cap, self.ti_dip_cap))
+      self.ti_dip_frames -= 1
       self.ti_held_frames = 0
+      self.ti_held_lo = self.ti_held_hi = apply_torque
+    elif apply_torque == 0:
+      # zero is a rest the interceptor allows
+      self.ti_held_frames = 0
+      self.ti_held_lo = self.ti_held_hi = 0
+    else:
+      self.ti_held_lo, self.ti_held_hi = min(self.ti_held_lo, apply_torque), max(self.ti_held_hi, apply_torque)
+      if self.ti_held_hi - self.ti_held_lo >= 2 * ti.STEER_DIP:
+        # it has moved further than any dip: whatever the interceptor counts as a change, this was one
+        self.ti_held_frames = 0
+        self.ti_held_lo = self.ti_held_hi = apply_torque
+      else:
+        self.ti_held_frames += 1
+        if self.ti_held_frames >= ti.STEER_HELD_FRAMES:
+          self.ti_dip_cap = max(abs(apply_torque) - ti.STEER_DIP, 0)
+          self.ti_dip_frames = ti.STEER_DIP_FRAMES - 1
+          apply_torque = int(np.clip(apply_torque, -self.ti_dip_cap, self.ti_dip_cap))
+          self.ti_held_frames = 0
+          self.ti_held_lo = self.ti_held_hi = apply_torque
 
     self.ti_apply_torque_last = apply_torque
     return apply_torque

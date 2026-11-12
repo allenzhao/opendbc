@@ -23,6 +23,7 @@ TI_FAULT_FRAMES = round(TorqueInterceptorParams.FAULT_T / DT_CTRL)
 TI_NOT_READY_ALERT_FRAMES = round(TorqueInterceptorParams.NOT_READY_ALERT_T / DT_CTRL)
 TI_BOOT_FRAMES = round(TorqueInterceptorParams.BOOT_T / DT_CTRL)
 TI_DRIVER_OVER_RELEASE_FRAMES = round(TorqueInterceptorParams.DRIVER_OVER_RELEASE_T / DT_CTRL)
+TI_DRIVER_OVER_RELEASE_STZ_FRAMES = round(TorqueInterceptorParams.DRIVER_OVER_RELEASE_STZ_T / DT_CTRL)
 TI_REFIT_FRAMES = round(TorqueInterceptorParams.REFIT_T / DT_CTRL)
 TI_RESTART_FRAMES = round(TorqueInterceptorParams.RESTART_T / DT_CTRL)
 TI_DROPOUT_FRAMES = round(TorqueInterceptorParams.DROPOUT_T / DT_CTRL)
@@ -114,7 +115,10 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     # held the wheel.
     self.ti_unfit_frames = 0
     self.ti_fit_frames = 0
-    self.ti_unpressed_frames = TI_DRIVER_OVER_RELEASE_FRAMES
+    # on steer-to-zero firmware the EPS command steers on while the interceptor is aside
+    self.ti_driver_over_release_frames = (TI_DRIVER_OVER_RELEASE_STZ_FRAMES if CP.flags & MazdaFlags.STEER_TO_ZERO_EPS
+                                          else TI_DRIVER_OVER_RELEASE_FRAMES)
+    self.ti_unpressed_frames = self.ti_driver_over_release_frames
     # Dropouts while moving, DROPOUT_T owed for each and paid off in real time; past
     # DROPOUT_ALERT_T it is dropping out for good (ti_dropping_out) until none is owed.
     self.ti_was_fit = False
@@ -123,6 +127,10 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     # Unfit for NOT_READY_ALERT_T or dropping out again and again: card publishes it as
     # CarStateZP.torqueInterceptor.notReady and the driver is told by name.
     self.ti_not_ready = False
+    # Steer-to-zero firmware: the steer fault is the EPS's non-delivery alone, with the
+    # interceptor fit (CarStateZP.torqueInterceptor.epsUndelivered). It is shown as it is
+    # without the interceptor, a banner without the escalation, and the interceptor steers on.
+    self.eps_undelivered = False
 
     self.distance_button = 0
     # The wheel's second distance button (farther). Upstream has one gapAdjustCruise type that
@@ -208,8 +216,13 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     elif self.lkas_block_origin_speed is None:
       self.lkas_block_origin_speed = v_ego_raw
 
+    # Beside an interceptor the low-speed gain is capped (controls_lateral_zp), so a crawl's
+    # request can stay under STEER_UNDELIVERED_MIN for as long as the standby lasts and never be
+    # bounded. In the standby the EPS delivers nothing whatever it is asked, and the interceptor
+    # steers meanwhile: there any request counts.
+    min_request = 0 if (self.ti_enabled and lkas_track_state) else self.params.STEER_UNDELIVERED_MIN
     if lkas_blocked and not self.steer_undelivered:
-      if self.lkas_effective == 0 and abs(lkas_request) > self.params.STEER_UNDELIVERED_MIN:
+      if self.lkas_effective == 0 and abs(lkas_request) > min_request:
         self.steer_undelivered_frames += 1
         self.steer_undelivered = self.steer_undelivered_frames >= self.params.STEER_UNDELIVERED_FRAMES
       else:
@@ -281,10 +294,11 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     than unfitness that stays. Dropouts further apart than that are counted one by one and,
     kept up, name it without a fault.
     """
-    self.ti_unpressed_frames = 0 if steering_pressed else min(self.ti_unpressed_frames + 1, TI_DRIVER_OVER_RELEASE_FRAMES)
+    release = self.ti_driver_over_release_frames
+    self.ti_unpressed_frames = 0 if steering_pressed else min(self.ti_unpressed_frames + 1, release)
     # Stepping aside for a driver who is steering through it is the interceptor working.
     driver_over = (self.ti_fresh and self.ti_state == TorqueInterceptorState.DRIVER_OVER and
-                   self.ti_unpressed_frames < TI_DRIVER_OVER_RELEASE_FRAMES)
+                   self.ti_unpressed_frames < release)
     moving = v_ego_raw >= TorqueInterceptorParams.MIN_SPEED
     # Silent, it is unplugged, unpowered, or bus 1 is not on the OBD-II pins: that is wrong at
     # any speed, once the command stream it answers to is up.
@@ -520,8 +534,12 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
       self.lkas_setting_on = any(cp_cam.vl["CAM_SETTINGS"][s] for s in ("LKAS_INERVENTION_ON1", "ILKAS_NTERVENTION_ON2"))
     camera_faulted = cp_cam.vl["CAM_LANEINFO"]["ERR_BIT"] == 1 or cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1
     las_off = cam_laneinfo_fresh and cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0 and not camera_faulted
-    # The interceptor steers through the torque sensor whatever the car's lane keep is set to.
-    ret.invalidLkasSetting = (las_off or not self.lkas_setting_on) and not self.ti_enabled
+    # The interceptor steers through the torque sensor whatever the car's lane keep is set to. On
+    # legacy firmware it is the actuator that matters, alone below the floor. On steer-to-zero
+    # firmware the EPS command is the other half of the steering at every speed, and its loss
+    # is reported as it is without the interceptor.
+    eps_masked = self.ti_enabled and not self.CP.flags & MazdaFlags.STEER_TO_ZERO_EPS
+    ret.invalidLkasSetting = (las_off or not self.lkas_setting_on) and not eps_masked
     self.update_lkas_arming(ret.invalidLkasSetting)
     self.lkas_setting_invalid = ret.invalidLkasSetting
 
@@ -536,23 +554,28 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     # Check if LKAS is disabled due to lack of driver torque when all other states indicate
     # it should be enabled (steer lockout). Don't warn until we actually get lkas active
     # and lose it again, i.e, after initial lkas activation
+    ti_fault = False
     if self.ti_enabled:
-      # The interceptor is the actuator at every speed, so the EPS's own LKAS block (its floor,
-      # its hands-off lockout) is no fault while the interceptor is fit.
-      ret.steerFaultTemporary = self.update_torque_interceptor_fault(ret.vEgoRaw, ret.steeringPressed)
+      # The interceptor steers at every speed, so the EPS's own LKAS block (its floor, its
+      # hands-off lockout) is no fault while the interceptor is fit. On steer-to-zero firmware
+      # the non-delivery alert below still is: the EPS's half of the steering is gone.
+      ti_fault = self.update_torque_interceptor_fault(ret.vEgoRaw, ret.steeringPressed)
+      eps_fault = bool(self.CP.flags & MazdaFlags.STEER_TO_ZERO_EPS) and self.steer_undelivered_alert
       # Named to the driver, it takes no new engagement either. The steer fault refuses that
       # only while the car moves, and cruise set at a stop under the standing alert would be
       # the take-control alarm on pulling away.
       ret.carNotReady = self.ti_not_ready
     elif not self.CP.flags & MazdaFlags.STEER_TO_ZERO_EPS:
-      ret.steerFaultTemporary = self.lkas_allowed_speed and lkas_blocked
+      eps_fault = self.lkas_allowed_speed and lkas_blocked
     else:
       # Report only sustained road-speed zero delivery after the command has been suppressed.
-      ret.steerFaultTemporary = self.steer_undelivered_alert
+      eps_fault = self.steer_undelivered_alert
     # The re-arm's block is expected and already shown to the driver; a soft disable over it would
-    # cost MADS its lateral on the older EPS just as it comes back.
+    # cost MADS its lateral on the older EPS just as it comes back. It is the EPS's alone.
     if self.lkas_arming and self.lkas_arming_frames < LKAS_REARM_FAULT_FRAMES:
-      ret.steerFaultTemporary = False
+      eps_fault = False
+    ret.steerFaultTemporary = ti_fault or eps_fault
+    self.eps_undelivered = self.ti_enabled and eps_fault and not ti_fault
 
     self.acc_active_last = ret.cruiseState.enabled
 
@@ -562,8 +585,9 @@ class CarState(CarStateBase, MadsCarState, CarStateExt):
     # camera signals
     self.cam_lkas = cp_cam.vl["CAM_LKAS"]
     self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
-    # A faulted camera takes the EPS's LKAS with it, not the interceptor.
-    ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 and not self.ti_enabled
+    # A faulted camera takes the EPS's LKAS with it, not the interceptor: on steer-to-zero
+    # firmware that is half the steering, as without the interceptor.
+    ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 and not eps_masked
     self.hbc_request = cam_laneinfo_fresh and self.cam_laneinfo["BIT2"] == 1
 
     # Decode distance, set-speed, resume, cancel, and main-button events.

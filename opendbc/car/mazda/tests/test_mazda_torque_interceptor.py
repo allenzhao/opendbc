@@ -6,14 +6,16 @@ command, and the controller run closed loop through the compiled safety model.
 from collections import deque
 from itertools import groupby
 
+import numpy as np
 import pytest
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, DT_CTRL
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.mazda.carcontroller import DASH_STEER_WARNING_QUIET_FRAMES, HUD_ALERT_FRAMES, CarController
-from opendbc.car.mazda.carstate import TI_BOOT_FRAMES, TI_BYPASS_FRAMES, TI_DRIVER_OVER_RELEASE_FRAMES, TI_DROPOUT_ALERT_FRAMES, \
-  TI_DROPOUT_FRAMES, TI_FAULT_FRAMES, TI_FEEDBACK_FRESH_FRAMES, TI_NOT_READY_ALERT_FRAMES, TI_REFIT_FRAMES, TI_RESTART_FRAMES
+from opendbc.car.mazda.carstate import TI_BOOT_FRAMES, TI_BYPASS_FRAMES, TI_DRIVER_OVER_RELEASE_FRAMES, TI_DRIVER_OVER_RELEASE_STZ_FRAMES, \
+  TI_DROPOUT_ALERT_FRAMES, TI_DROPOUT_FRAMES, TI_FAULT_FRAMES, TI_FEEDBACK_FRESH_FRAMES, TI_NOT_READY_ALERT_FRAMES, TI_REFIT_FRAMES, \
+  TI_RESTART_FRAMES
 from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.mazdacan import TI_BUS, TI_KEY, create_ti_steering_control
 from opendbc.car.mazda.tests.conftest import CAM_LANEINFO, CAM_LKAS, DBC_NAME, VisualAlert, car_params, car_params_sp, eps_fw, \
@@ -67,9 +69,36 @@ def ti_torque(sends) -> int | None:
 
 
 def at_rest_on(value: int, target: int) -> bool:
-  """A steady request sits on its target or, for the odd frame, one count nearer zero
-  (TorqueInterceptorParams.STEER_HELD_FRAMES)."""
-  return value in (target, target - (1 if target > 0 else -1))
+  """A steady request sits on its target or, for the stuck-request guard's dip and the climb
+  back from it, up to TorqueInterceptorParams.STEER_DIP nearer zero."""
+  if target == 0:
+    return value == 0
+  sign = 1 if target > 0 else -1
+  return 0 <= sign * (target - value) <= TI.STEER_DIP
+
+
+# The shortest VIOL_LKAS_STUK latch on record: 1.84 s of a request that did not move.
+STUCK_LATCH_FRAMES = round(1.84 / DT_CTRL)
+# Ways the interceptor might read "not moving" that no log rules out: it may sample every
+# frame or at its own 50 Hz or slower, count any change or only one of 10 counts (the smallest
+# on record to restart it), and its clip may or may not be a rest it allows on a given unit.
+FIRMWARE_READINGS = [dict(change=change, every=every, clip_exempt=exempt) for change in (1, 10) for every in (1, 2, 5)
+                     for exempt in (False, True)]
+
+
+def longest_unmoved(seen, change=1, every=1, clip_exempt=False) -> int:
+  """Frames the interceptor's stuck timer runs at most on these requests, for a firmware that
+  reads one in every `every` and restarts it on a move of `change` counts or more from where
+  it last did. Zero, and the clip if exempt, are rests it allows."""
+  longest = run = 0
+  ref = None
+  for value in seen[::every]:
+    if value == 0 or (clip_exempt and abs(value) == TI.STEER_MAX) or ref is None or abs(value - ref) >= change:
+      ref, run = value, 0
+    else:
+      run += every
+    longest = max(longest, run)
+  return longest
 
 
 class Car:
@@ -117,9 +146,12 @@ class TestInterface:
     assert not CP.steerAtStandstill
 
   def test_steer_to_zero_firmware_keeps_its_zero_floor(self):
+    # a 2017-21 CX-5 with a steer-to-zero EPS swapped in: both actuators at every speed
     CP, _ = ti_car_params(CAR.MAZDA_CX5, car_fw=STEER_TO_ZERO_FW)
     assert CP.flags & MazdaFlags.STEER_TO_ZERO_EPS and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR
+    assert not CP.flags & MazdaFlags.LEGACY_FW_EPS
     assert CP.minSteerSpeed == 0
+    assert CP.safetyConfigs[0].safetyParam == MazdaSafetyFlags.EPS_HW | MazdaSafetyFlags.TORQUE_INTERCEPTOR
 
   @pytest.mark.parametrize("enabled", ["0", 0, False])
   def test_off_changes_nothing(self, enabled):
@@ -185,14 +217,38 @@ class TestTune:
     assert CP.lateralTuning.torque.friction == stock.lateralTuning.torque.friction
 
   @pytest.mark.parametrize("platform", list(CAR))
-  def test_no_speed_binned_seeds_and_a_cache_of_its_own(self, platform):
+  def test_seeds_and_a_cache_of_its_own(self, platform):
     # the tables were learned on the EPS command alone, most behind steer-to-zero firmware;
-    # lifting the floor must not hand a legacy EPS those. The default bins it learns on carry
-    # a seed version no table uses, so neither plant restores what the other learned
-    cfg = get_speed_dep_config_for_car(ti_car_params(platform)[0])
-    assert cfg == {'seed_version': TI.SPEED_DEP_SEED_VERSION}
-    assert all(entry.get('seed_version', 0) != TI.SPEED_DEP_SEED_VERSION for entry in get_speed_dep_config().values())
-    assert get_speed_dep_config_for_car(car_params(platform)).get('seed_version', 0) != TI.SPEED_DEP_SEED_VERSION
+    # lifting the floor must not hand a legacy EPS those: it learns from the default bins on the
+    # offline values. On steer-to-zero firmware both steer, and the bins start at their sum.
+    # Each carries a seed version no table uses, so no two plants restore what another learned
+    CP = ti_car_params(platform)[0]
+    cfg = get_speed_dep_config_for_car(CP)
+    if CP.flags & MazdaFlags.STEER_TO_ZERO_EPS:
+      assert cfg == {'seed_version': TI.STZ_SPEED_DEP_SEED_VERSION, 'speed_bp': TI.STZ_SPEED_BP, 'laf_bp': TI.STZ_LAF_BP,
+                     'friction_bp': TI.STZ_FRICTION_BP, 'min_speed': TI.STZ_MIN_SPEED}
+    else:
+      assert cfg == {'seed_version': TI.SPEED_DEP_SEED_VERSION}
+    versions = {TI.SPEED_DEP_SEED_VERSION, TI.STZ_SPEED_DEP_SEED_VERSION}
+    assert len(versions) == 2
+    assert all(entry.get('seed_version', 0) not in versions for entry in get_speed_dep_config().values())
+    assert get_speed_dep_config_for_car(car_params(platform)).get('seed_version', 0) not in versions
+
+  def test_an_eps_swapped_car_starts_each_bin_above_the_eps_alone(self):
+    # a 2017-21 body on steer-to-zero firmware takes the table, and every bin starts a clear
+    # share above what the EPS command alone was learned to give there
+    CP = ti_car_params(CAR.MAZDA_CX5, car_fw=STEER_TO_ZERO_FW)[0]
+    cfg = get_speed_dep_config_for_car(CP)
+    assert cfg['seed_version'] == TI.STZ_SPEED_DEP_SEED_VERSION
+    assert len(cfg['speed_bp']) == len(cfg['laf_bp']) == len(cfg['friction_bp'])
+    assert cfg['speed_bp'] == sorted(cfg['speed_bp']) and cfg['min_speed'] < cfg['speed_bp'][0]
+    eps = get_speed_dep_config()['MAZDA_CX5_2022']
+    for speed, factor, friction in zip(cfg['speed_bp'], cfg['laf_bp'], cfg['friction_bp'], strict=True):
+      assert factor > np.interp(speed, eps['speed_bp'], eps['laf_bp']) + 0.5, speed
+      # the same steering friction in lateral accel, over the larger factor
+      assert friction < np.interp(speed, eps['speed_bp'], eps['friction_bp']), speed
+    # the crawl after a stop, the EPS in its standby, is under the bins where both steer
+    assert cfg['laf_bp'][0] < min(cfg['laf_bp'][1:3])
 
   @pytest.mark.parametrize("platform", list(CAR))
   def test_without_it_the_helpers_are_untouched(self, platform):
@@ -213,6 +269,10 @@ class TestTune:
     assert TI.REFIT_T >= TI.STEER_MAX / TI.STEER_DELTA_UP * DT_CTRL, "no count forgotten before the command is back"
     assert TI.REFIT_T < TI.DROPOUT_T < TI.DROPOUT_ALERT_T
     assert TI.NOT_READY_ALERT_T > TI.DRIVER_OVER_RELEASE_T + TI.FAULT_T, "a let-go wheel is not named"
+    assert TI.DRIVER_OVER_RELEASE_T < TI.DRIVER_OVER_RELEASE_STZ_T <= 2.5, "the EPS steers on meanwhile there, nothing else does on legacy"
+    assert TI.STEER_HELD_FRAMES + TI.STEER_DIP_FRAMES <= round(1.4 / DT_CTRL), "the driven guard's period, inside 1.84 s"
+    assert TI.STEER_DIP >= 2 * 10, "twice the smallest move on record to restart its count"
+    assert TI.STEER_DIP_FRAMES >= round(0.2 / DT_CTRL), "the driven dip's 0.2 s, four 20 Hz samples"
 
   def test_the_eps_command_yields_over_the_interceptors_span(self):
     ccp = CarControllerParams(ti_car_params()[0])
@@ -570,21 +630,30 @@ class TestCarState:
       faulted |= car.run(1, latched).steerFaultTemporary
     assert faulted
 
-  def test_the_driver_steering_through_it_is_no_fault(self):
+  @pytest.mark.parametrize("car_fw, release", [(None, TI_DRIVER_OVER_RELEASE_FRAMES), (STEER_TO_ZERO_FW, TI_DRIVER_OVER_RELEASE_STZ_FRAMES)])
+  def test_the_driver_steering_through_it_is_no_fault(self, car_fw, release):
     # DRIVER_OVER: the interceptor steps aside for a hard push. Not ready, and not a fault
-    # while the driver holds the wheel or has just let go
-    car = Car()
+    # while the driver holds the wheel or has just let go. On steer-to-zero firmware the EPS
+    # steers on meanwhile, and it is given longer to come back
+    car = Car(car_fw=car_fw)
     car.speed_kph = 60.
     car.run(20, feedback())
     over = TorqueInterceptorState.DRIVER_OVER
     ret = car.run(300, feedback(torque=60, state=over))
     assert ret.steeringPressed and not car.CS.ti_ready and not ret.steerFaultTemporary
-    # let go: it has DRIVER_OVER_RELEASE_T to come back
-    ret = car.run(TI_DRIVER_OVER_RELEASE_FRAMES + TI_FAULT_FRAMES - 10, feedback(state=over))
-    assert not ret.steeringPressed and not ret.steerFaultTemporary
+    # let go: it has its release time to come back, and is not named meanwhile
+    for _ in range(release + TI_FAULT_FRAMES - 10):
+      ret = car.run(1, feedback(state=over))
+      assert not ret.steerFaultTemporary and not car.CS.ti_not_ready
+    assert not ret.steeringPressed
     assert not car.run(20, feedback()).steerFaultTemporary
-    # stuck there with nobody on the wheel, it is a fault like any other
-    assert car.run(TI_DRIVER_OVER_RELEASE_FRAMES + TI_FAULT_FRAMES + 20, feedback(state=over)).steerFaultTemporary
+    # stuck there with nobody on the wheel past it, it is a fault like any other
+    car = Car(car_fw=car_fw)
+    car.speed_kph = 60.
+    car.run(20, feedback())
+    car.run(300, feedback(torque=60, state=over))
+    assert not car.run(release + TI_FAULT_FRAMES - 10, feedback(state=over)).steerFaultTemporary
+    assert car.run(20, feedback(state=over)).steerFaultTemporary
 
   def test_stepping_aside_for_the_driver_counts_as_fit_toward_a_fault_clearing(self):
     # a fault counted against it, then the driver steers through it: those frames are the
@@ -614,13 +683,85 @@ class TestCarState:
     car.speed_kph = TI.MIN_SPEED * CV.MS_TO_KPH - 0.5
     assert not car.run(20, feedback(state=TorqueInterceptorState.OFF, viol=0x12)).steerFaultTemporary
 
-  def test_the_cars_lane_keep_setting_and_camera_fault_do_not_stop_it(self):
+  def test_the_cars_lane_keep_setting_and_camera_fault_do_not_stop_it_on_legacy_firmware(self):
+    # there the interceptor is the actuator that matters, alone below the floor
     car = Car()
     off = car.packer.make_can_msg("CAM_SETTINGS", 2, {"LKAS_INERVENTION_ON1": 0, "ILKAS_NTERVENTION_ON2": 0})
     faulted = car.packer.make_can_msg("CAM_LKAS", 2, {"ERR_BIT_1": 1})
     ret = car.run(20, feedback(), extra=[off, faulted])
     assert not ret.invalidLkasSetting
     assert not ret.steerFaultPermanent
+
+  @pytest.mark.parametrize("cause", ["lane keep off", "camera fault"])
+  def test_on_steer_to_zero_firmware_the_eps_losing_its_share_is_reported_as_without_it(self, cause):
+    # there the EPS command is the other half of the steering at every speed
+    car, stock = Car(car_fw=STEER_TO_ZERO_FW), Car(car_fw=STEER_TO_ZERO_FW)
+    stock.CI = CarInterface(*ti_car_params(enabled="0", car_fw=STEER_TO_ZERO_FW))
+    if cause == "lane keep off":
+      msg = car.packer.make_can_msg("CAM_SETTINGS", 2, {"LKAS_INERVENTION_ON1": 0, "ILKAS_NTERVENTION_ON2": 0})
+    else:
+      msg = car.packer.make_can_msg("CAM_LKAS", 2, {"ERR_BIT_1": 1})
+    ret, ret_stock = car.run(20, feedback(), extra=[msg]), stock.run(20, extra=[msg])
+    assert (ret.invalidLkasSetting, ret.steerFaultPermanent) == (ret_stock.invalidLkasSetting, ret_stock.steerFaultPermanent)
+    assert ret.invalidLkasSetting if cause == "lane keep off" else ret.steerFaultPermanent
+
+  def test_on_steer_to_zero_firmware_the_eps_not_delivering_is_its_own_fault(self):
+    # a road-speed block with nothing delivered: the alert zoompilot shows on this firmware
+    # without the interceptor, apart from the interceptor's own faults
+    car = Car(car_fw=STEER_TO_ZERO_FW)
+    car.speed_kph = 60.
+    assert not car.run(20, feedback()).steerFaultTemporary
+    p = car.CS.params
+    dropped = car.packer.make_can_msg("STEER_RATE", 0, {"LKAS_BLOCK": 1, "LKAS_REQUEST": 400, "LKAS_EFFECTIVE": 0})
+    assert not car.run(p.STEER_UNDELIVERED_FRAMES + p.STEER_UNDELIVERED_ALERT_FRAMES - 5, feedback(), extra=[dropped]).steerFaultTemporary
+    ret = car.run(10, feedback(), extra=[dropped])
+    assert ret.steerFaultTemporary and car.CS.eps_undelivered and car.CS.ti_ready
+    # the interceptor's own fault beside it is the interceptor's
+    ret = car.run(TI_FAULT_FRAMES + 5, feedback(state=TorqueInterceptorState.OFF, viol=0x11), extra=[dropped])
+    assert ret.steerFaultTemporary and not car.CS.eps_undelivered
+    # on legacy firmware the EPS's block is no fault while the interceptor is fit
+    legacy = Car()
+    legacy.speed_kph = 60.
+    legacy.run(20, feedback())
+    ret = legacy.run(p.STEER_UNDELIVERED_FRAMES + p.STEER_UNDELIVERED_ALERT_FRAMES + 10, feedback(), extra=[dropped])
+    assert not ret.steerFaultTemporary and not legacy.CS.eps_undelivered
+
+  @pytest.mark.parametrize("ti", [True, False])
+  def test_in_the_eps_standby_any_request_beside_it_is_bounded(self, ti):
+    # after a stop the EPS delivers nothing until its standby lifts. The low-speed gain beside
+    # the interceptor keeps a crawl's request under STEER_UNDELIVERED_MIN, so there any request
+    # latches the EPS command off; without the interceptor the threshold stands
+    car = Car(car_fw=STEER_TO_ZERO_FW)
+    if not ti:
+      car.CI = CarInterface(*ti_car_params(enabled="0", car_fw=STEER_TO_ZERO_FW))
+    car.speed_kph = 5.
+    car.run(20, feedback())
+    p = car.CS.params
+    standby = car.packer.make_can_msg("STEER_RATE", 0, {"LKAS_BLOCK": 1, "LKAS_TRACK_STATE": 1, "LKAS_REQUEST": 50, "LKAS_EFFECTIVE": 0})
+    ret = car.run(p.STEER_UNDELIVERED_FRAMES + 5, feedback(), extra=[standby])
+    assert car.CS.steer_undelivered == ti
+    # the standby is no alert either way
+    assert not ret.steerFaultTemporary
+    # a block without the standby keeps the threshold: below it the EPS rounds to zero anyway
+    car.speed_kph = 60.
+    car.run(5, feedback(), extra=[car.packer.make_can_msg("STEER_RATE", 0, {"LKAS_BLOCK": 0})])
+    assert not car.CS.steer_undelivered
+    small = car.packer.make_can_msg("STEER_RATE", 0, {"LKAS_BLOCK": 1, "LKAS_REQUEST": 50, "LKAS_EFFECTIVE": 0})
+    car.run(p.STEER_UNDELIVERED_FRAMES + 5, feedback(), extra=[small])
+    assert not car.CS.steer_undelivered
+
+  def test_the_eps_rearming_does_not_hide_an_interceptor_fault(self):
+    # the car's lane keep switched back on: the EPS's re-arm block is expected and no fault of
+    # its own, but a latched interceptor beside it is
+    car = Car(car_fw=STEER_TO_ZERO_FW)
+    car.speed_kph = 60.
+    off = car.packer.make_can_msg("CAM_SETTINGS", 2, {"LKAS_INERVENTION_ON1": 0, "ILKAS_NTERVENTION_ON2": 0})
+    on = car.packer.make_can_msg("CAM_SETTINGS", 2, {"LKAS_INERVENTION_ON1": 1, "ILKAS_NTERVENTION_ON2": 1})
+    assert car.run(20, feedback(), extra=[off]).invalidLkasSetting
+    car.run(5, feedback(), extra=[on])
+    assert car.CS.lkas_arming
+    ret = car.run(TI_FAULT_FRAMES + 5, feedback(state=TorqueInterceptorState.OFF, viol=0x11), extra=[on])
+    assert car.CS.lkas_arming and ret.steerFaultTemporary and not car.CS.eps_undelivered
 
   def test_the_panda_refusing_the_command_is_reported_for_one_cycle(self):
     car = Car()
@@ -1036,37 +1177,86 @@ class TestController:
       assert at_rest_on(ti_torque(sends), share), driver
 
   @pytest.mark.parametrize("sign", [1, -1])
-  @pytest.mark.parametrize("torque, driver", [(0.6, 20), (0.3, 0), (0.3, 10), (0.002, 0), (0.66, 0)])
+  @pytest.mark.parametrize("torque, driver", [(0.6, 20), (0.3, 0), (0.3, 10), (0.002, 0), (0.01, 0), (0.66, 0),
+                                              (TI.STEER_MAX / TI.STEER_SCALE, 0), (1.0, 0)])
   def test_a_request_at_rest_is_kept_moving(self, sign, torque, driver):
-    # the interceptor reads a request that sits still off 0 and off its clip as a stuck sender
-    # and latches off for 30 s. A steady hand against the command pins the driver limit there;
-    # a quiet road pins the controller's own output
+    # the interceptor reads a request that sits still as a stuck sender and latches off for
+    # 30 s. A steady hand against the command pins the driver limit, a quiet road the
+    # controller's own output and a tight turn the clip, which no log shows exempt on a unit
     cc, cs = ti_controller()
     seen = []
-    for _ in range(600):
+    for _ in range(1200):
       _, sends = step(cc, cs, torque=sign * torque, v_ego=20., driver_torque=-sign * driver, steering_pressed=driver > TI.STEER_THRESHOLD, **LAT)
       seen.append(ti_torque(sends))
     limit = TI.STEER_MAX - max(driver + cc.params.STEER_DRIVER_MARGIN - TI.STEER_DRIVER_ALLOWANCE, 0) * TI.STEER_DRIVER_MULTIPLIER
     rest = sign * min(round(torque * TI.STEER_SCALE), limit)
-    assert 0 < abs(rest) < TI.STEER_MAX
+    assert 0 < abs(rest) <= TI.STEER_MAX
     settled = seen[200:]
-    assert set(settled) == {rest, rest - sign}
-    longest = max(len(list(run)) for _, run in groupby(settled))
-    assert longest <= TI.STEER_HELD_FRAMES
-    # one frame off it in every STEER_HELD_FRAMES + 1, and straight back
-    assert settled.count(rest - sign) in (len(settled) // (TI.STEER_HELD_FRAMES + 1), len(settled) // (TI.STEER_HELD_FRAMES + 1) + 1)
-    assert all(n == 1 for value, n in ((v, len(list(run))) for v, run in groupby(settled)) if value == rest - sign)
+    # on its rest, or STEER_DIP nearer zero for STEER_DIP_FRAMES and climbing back
+    dip = sign * max(abs(rest) - TI.STEER_DIP, 0)
+    assert all(min(dip, rest) <= v <= max(dip, rest) for v in settled)
+    runs = [(value, len(list(run))) for value, run in groupby(settled)]
+    assert max(n for value, n in runs if value == rest) <= TI.STEER_HELD_FRAMES
+    dips = [n for value, n in runs[1:-1] if value == dip]
+    assert len(dips) >= len(settled) // (TI.STEER_HELD_FRAMES + TI.STEER_DIP_FRAMES) - 1
+    assert all(n == TI.STEER_DIP_FRAMES for n in dips)
+    # however the interceptor reads it, it never sees the request sit still for its latch time
+    for reading in FIRMWARE_READINGS:
+      assert longest_unmoved(settled, **reading) < STUCK_LATCH_FRAMES, reading
+    # and it costs a few counts on average
+    assert sum(abs(rest - v) for v in settled) / len(settled) <= 4
+
+  @pytest.mark.parametrize("wander", [1, 2, 4])
+  def test_a_request_that_wanders_inside_a_few_counts_is_kept_moving(self, wander):
+    # a noisy road or hand: the request is never the same two frames running, but it stays
+    # within a few counts, which an interceptor that counts only a move of 10 reads as still
+    cc, cs = ti_controller()
+    seen = []
+    for i in range(1500):
+      offset = wander * (1 if (i // 3) % 2 else -1)
+      _, sends = step(cc, cs, torque=(300 + offset) / TI.STEER_SCALE, v_ego=20., **LAT)
+      seen.append(ti_torque(sends))
+    for reading in FIRMWARE_READINGS:
+      assert longest_unmoved(seen[200:], **reading) < STUCK_LATCH_FRAMES, reading
+
+  def test_a_refusal_ends_the_dip(self):
+    # the interceptor unfit for a moment in the middle of a dip: its command starts again from
+    # zero and climbs straight to the rest, with nothing left of the dip to hold it under
+    cc, cs = ti_controller()
+    rest = 90
+    seen = []
+    while len(seen) < 2 or seen[-1] != rest - TI.STEER_DIP:
+      _, sends = step(cc, cs, torque=rest / TI.STEER_SCALE, v_ego=20., **LAT)
+      seen.append(ti_torque(sends))
+      assert len(seen) < 400
+    cs.ti_ready = False
+    for _ in range(2):
+      _, sends = step(cc, cs, torque=rest / TI.STEER_SCALE, v_ego=20., **LAT)
+      assert ti_torque(sends) == 0
+    cs.ti_ready = True
+    climb = []
+    for _ in range(rest // TI.STEER_DELTA_UP + 2):
+      _, sends = step(cc, cs, torque=rest / TI.STEER_SCALE, v_ego=20., **LAT)
+      climb.append(ti_torque(sends))
+    assert climb[-1] == rest
+
+  def test_a_request_that_keeps_moving_is_never_dipped(self):
+    cc, cs = ti_controller()
+    seen = []
+    for i in range(1000):
+      _, sends = step(cc, cs, torque=float(0.4 * np.sin(2 * np.pi * 0.5 * i * DT_CTRL)), v_ego=20., **LAT)
+      seen.append(ti_torque(sends))
+    # nothing steps down past the down rate: the guard never cut in
+    assert all(abs(a - b) <= TI.STEER_DELTA_DOWN for a, b in zip(seen, seen[1:], strict=False))
 
   @pytest.mark.parametrize("sign", [1, -1])
-  @pytest.mark.parametrize("torque", [TI.STEER_MAX / TI.STEER_SCALE, 1.0, 0.])
-  def test_a_request_at_rest_on_zero_or_the_clip_is_left_alone(self, sign, torque):
-    # the two values the interceptor lets a request sit still on
+  def test_a_request_at_rest_on_zero_is_left_alone(self, sign):
     cc, cs = ti_controller()
     seen = []
     for _ in range(400):
-      _, sends = step(cc, cs, torque=sign * torque, v_ego=20., **LAT)
+      _, sends = step(cc, cs, torque=sign * 0., v_ego=20., **LAT)
       seen.append(ti_torque(sends))
-    assert set(seen[200:]) == {sign * min(round(torque * TI.STEER_SCALE), TI.STEER_MAX)}
+    assert set(seen) == {0}
 
   def test_a_request_never_sits_still_however_it_is_driven(self):
     import random
@@ -1078,9 +1268,12 @@ class TestController:
         torque, driver = rng.choice([0., 0.01, 0.2, 0.5, 0.66, 0.67, 1.0]) * rng.choice([1, -1]), rng.choice([0, 0, 12, 18, 25, 40]) * rng.choice([1, -1])
       _, sends = step(cc, cs, torque=torque, v_ego=20., driver_torque=driver, steering_pressed=abs(driver) > TI.STEER_THRESHOLD, **LAT)
       seen.append(ti_torque(sends))
+    for reading in FIRMWARE_READINGS:
+      assert longest_unmoved(seen, **reading) < STUCK_LATCH_FRAMES, reading
+    # the clip is held as long as anything else, and moved like it
     runs = [(value, len(list(run))) for value, run in groupby(seen)]
-    assert max(n for value, n in runs if value not in (0, TI.STEER_MAX, -TI.STEER_MAX)) <= TI.STEER_HELD_FRAMES
-    assert any(n > TI.STEER_HELD_FRAMES for value, n in runs if abs(value) == TI.STEER_MAX)
+    assert max(n for value, n in runs if value != 0) <= TI.STEER_HELD_FRAMES
+    assert any(abs(value) == TI.STEER_MAX - TI.STEER_DIP and n == TI.STEER_DIP_FRAMES for value, n in runs)
 
   def test_a_push_with_the_command_costs_nothing(self):
     cc, cs = ti_controller()
@@ -1279,11 +1472,25 @@ class TestClosedLoopThroughThePanda:
 
   @pytest.mark.parametrize("driver", [-16, -20, -27, 22])
   def test_a_steady_hand_against_it(self, driver):
-    # the request held on the driver limit and nudged a count now and then: all admitted
+    # the request held on the driver limit and dipped now and then, the climb back included:
+    # all admitted, and never still for the interceptor's latch time
     profile = [(0.66 if driver < 0 else -0.66, driver, 20., {}) for _ in range(800)]
     refused, admitted, *_ = self.loop(profile)
     assert refused == []
-    assert len(set(admitted[300:])) == 2
+    assert max(admitted[300:]) - min(admitted[300:]) == TI.STEER_DIP
+    for reading in FIRMWARE_READINGS:
+      assert longest_unmoved(admitted[300:], **reading) < STUCK_LATCH_FRAMES, reading
+
+  @pytest.mark.parametrize("sign", [1, -1])
+  def test_held_on_the_clip(self, sign):
+    # a tight turn: the request on the clip, dipped like any other rest, all admitted
+    refused, admitted, *_ = self.loop([(sign * 1.0, 0, 20., {}) for _ in range(800)])
+    assert refused == []
+    assert sign * max(sign * a for a in admitted) == sign * TI.STEER_MAX
+    assert set(admitted[300:]) <= set(range(min(sign * TI.STEER_MAX, sign * (TI.STEER_MAX - TI.STEER_DIP)),
+                                            max(sign * TI.STEER_MAX, sign * (TI.STEER_MAX - TI.STEER_DIP)) + 1))
+    for reading in FIRMWARE_READINGS:
+      assert longest_unmoved(admitted[300:], **reading) < STUCK_LATCH_FRAMES, reading
 
   def test_no_torque_reaches_it_while_openpilot_is_not_steering(self):
     panda = Panda()

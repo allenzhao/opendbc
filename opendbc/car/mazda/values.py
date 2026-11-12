@@ -126,9 +126,16 @@ class CarControllerParams:
       self.STEER_RAIL_SCHEDULE = ([0.], [ti.STEER_MAX / ti.STEER_SCALE])
       self.STEER_SLEW_SCHEDULE = ([0.], [ti.STEER_DELTA_UP / ti.STEER_SCALE], [ti.STEER_DELTA_DOWN / ti.STEER_SCALE])
       # The speed-binned seeds were learned on the EPS command alone, most behind steer-to-zero
-      # firmware. With the interceptor adding its share the car learns its own from the default
-      # bins, under a seed version of its own so neither plant restores the other's cache.
-      self.SPEED_DEP_CONFIG = {'seed_version': ti.SPEED_DEP_SEED_VERSION}
+      # firmware. With the interceptor adding its share the car learns its own, under a seed
+      # version of its own so neither plant restores the other's cache. On legacy firmware from
+      # the default bins on the offline values: below the floor the interceptor steers alone.
+      # On steer-to-zero firmware the EPS command steers beside it at every speed, from the same
+      # torque, so each bin starts at the sum of the two shares (TorqueInterceptorParams.STZ_*).
+      if CP.flags & MazdaFlags.STEER_TO_ZERO_EPS:
+        self.SPEED_DEP_CONFIG = {'seed_version': ti.STZ_SPEED_DEP_SEED_VERSION, 'speed_bp': ti.STZ_SPEED_BP,
+                                 'laf_bp': ti.STZ_LAF_BP, 'friction_bp': ti.STZ_FRICTION_BP, 'min_speed': ti.STZ_MIN_SPEED}
+      else:
+        self.SPEED_DEP_CONFIG = {'seed_version': ti.SPEED_DEP_SEED_VERSION}
 
 
 class TorqueInterceptorParams:
@@ -141,10 +148,13 @@ class TorqueInterceptorParams:
   documentation (docs/zoompilot/mazda-torque-interceptor.md).
   """
   # The TI clips the request at 600 itself. It also latches VIOL_LKAS_STUK for 30 s on a request
-  # that sits still anywhere other than 0 or +-600, so nothing may plateau below this: the
-  # controller's rail (lateral_tune.get_steer_rail_schedule) lands exactly on it.
+  # that sits still, and its documentation exempts 0 and +-600; the controller's rail
+  # (lateral_tune.get_steer_rail_schedule) lands exactly on the clip, and the guard below moves
+  # a request held there too, since no log shows the exemption on any given unit.
   STEER_MAX = 600
-  # The TI author's rates; its firmware ramps the bias down by itself on a faster rise.
+  # The TI author's shipped rates. The firmware ramps its bias down by itself on a rise it calls
+  # unsafe; that rate is not published, and 10/25 and 12/25 have been driven on TI1 units
+  # without a recorded ramp-down.
   STEER_DELTA_UP = 6              # torque increase per refresh
   STEER_DELTA_DOWN = 15           # torque decrease per refresh
   STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
@@ -152,8 +162,15 @@ class TorqueInterceptorParams:
   STEER_DRIVER_FACTOR = 1
   # 100 Hz, engaged or not: a gap in the stream over 100 ms is the TI's VIOL_CAN_TMO.
   STEER_STEP = 1
-  # Frames a request may sit on one value, other than 0 and the clip, before it is moved a count.
-  STEER_HELD_FRAMES = 25
+  # A request that sits still latches VIOL_LKAS_STUK at 1.84 to 2.0 s on record (TheDeliSandwich's
+  # CX-9, at a held 800 and a held -1). What counts as moving is not: a 10-count dip seen at
+  # 20 Hz restarted the count, and nothing smaller is on record. So a request that has stayed
+  # inside a band of 2 x STEER_DIP for STEER_HELD_FRAMES is held STEER_DIP counts nearer zero
+  # for STEER_DIP_FRAMES, the clip included, and the limits bring it back: the shape that has
+  # been driven on a TI1 (20 counts for 0.2 s every 1.4 s, at a 700 ceiling).
+  STEER_HELD_FRAMES = 120
+  STEER_DIP = 20                  # counts
+  STEER_DIP_FRAMES = 20
 
   # Counts per unit of normalized torque. The EPS command is u x EPS_STEER_MAX on a tune
   # TUNE_SCALE x upstream's, so this is upstream's u x 600: three quarters of the EPS command's
@@ -207,11 +224,31 @@ class TorqueInterceptorParams:
   # is said about it before this.
   BOOT_T = 8.0                    # s
   # DRIVER_OVER is the TI stepping aside for a driver steering through it, not a fault. It may
-  # take this long to return to RUN once the wheel is let go.
+  # take this long to return to RUN once the wheel is let go. How long it really takes is not
+  # on record; at start-up it has sat in DRIVER_OVER some 1.8 s with nobody on the wheel
+  # (pdscomp's capture). On steer-to-zero firmware the EPS command steers on meanwhile, so the
+  # longer wait costs little there; on legacy firmware below the floor nothing else steers.
   DRIVER_OVER_RELEASE_T = 1.0     # s
+  DRIVER_OVER_RELEASE_STZ_T = 2.5  # s
 
   # The speed-binned learner's cache version for a car steered through the interceptor.
   SPEED_DEP_SEED_VERSION = 64
+  # Steer-to-zero firmware: the EPS command steers beside the interceptor at every speed, so
+  # lateral accel per unit torque is the two shares added. The EPS's is the CX-5 2022 table on
+  # this firmware (speed_dependent.toml), and the interceptor's is estimated from a CX-9's
+  # interceptor-only fits below 45 kph (2.6 and 2.05 at 800 counts, so 2.9 and 2.3 on
+  # STEER_SCALE, less a fifth for the lighter car). Above that its share is not on record; it
+  # is taken to fall with speed as the EPS's assist does. A seed under the plant's real
+  # gain overshoots and rings, and the learner's +-30 % clip cannot climb out of a flat 2.64.
+  # One over it is only weak at first, so the doubtful bins lean high. The 3.5 m/s bin is the
+  # crawl after a stop, where the EPS sits in its standby and the interceptor steers alone
+  # until about 3 m/s. Friction is the EPS-only table's steering friction in lateral accel
+  # over the larger factor.
+  STZ_SPEED_DEP_SEED_VERSION = 65
+  STZ_SPEED_BP = [3.5, 6.5, 10.0, 15.0, 21.0, 26.5, 32.0, 37.5]
+  STZ_LAF_BP = [3.0, 4.4, 4.6, 3.3, 2.9, 3.1, 3.2, 3.3]
+  STZ_FRICTION_BP = [0.075, 0.075, 0.075, 0.075, 0.07, 0.065, 0.06, 0.06]
+  STZ_MIN_SPEED = 2.0             # m/s, the lower edge of the crawl bin, as on the EPS-only table
 
 
 class TorqueInterceptorState(IntEnum):
