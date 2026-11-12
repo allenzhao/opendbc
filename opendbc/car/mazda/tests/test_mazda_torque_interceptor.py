@@ -12,14 +12,14 @@ from opendbc.can import CANPacker
 from opendbc.car import Bus, DT_CTRL
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.mazda.carcontroller import DASH_STEER_WARNING_QUIET_FRAMES, HUD_ALERT_FRAMES, CarController
-from opendbc.car.mazda.carstate import TI_BOOT_FRAMES, TI_BYPASS_FRAMES, TI_DRIVER_OVER_RELEASE_FRAMES, TI_FAULT_FRAMES, \
-  TI_FEEDBACK_FRESH_FRAMES, TI_NOT_READY_ALERT_FRAMES, TI_REFIT_FRAMES
+from opendbc.car.mazda.carstate import TI_BOOT_FRAMES, TI_BYPASS_FRAMES, TI_DRIVER_OVER_RELEASE_FRAMES, TI_DROPOUT_ALERT_FRAMES, \
+  TI_DROPOUT_FRAMES, TI_FAULT_FRAMES, TI_FEEDBACK_FRESH_FRAMES, TI_NOT_READY_ALERT_FRAMES, TI_REFIT_FRAMES, TI_RESTART_FRAMES
 from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.mazdacan import TI_BUS, TI_KEY, create_ti_steering_control
 from opendbc.car.mazda.tests.conftest import CAM_LANEINFO, CAM_LKAS, DBC_NAME, VisualAlert, car_params, car_params_sp, eps_fw, \
   frame, frames, hands_code, mazda_car_state, packer, step
 from opendbc.car.mazda.values import CAR, LKAS_LIMITS, CarControllerParams, MazdaFlags, MazdaSafetyFlags, \
-  TorqueInterceptorParams as TI, TorqueInterceptorState
+  TorqueInterceptorCause, TorqueInterceptorParams as TI, TorqueInterceptorState
 from opendbc.car.structs import CarParams
 from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.sunnypilot.car.interfaces import setup_interfaces
@@ -159,9 +159,10 @@ class TestInterface:
 class TestTune:
   """The interceptor is the reported actuator: the lateral stack reads its rail and slew."""
 
-  def test_scale_keeps_upstreams_ratio_to_the_eps_command(self):
-    # the interceptor was developed beside an 800-count EPS command at 600; the EPS command is
-    # on 1200 here, so the same share is 900
+  def test_scale_is_three_quarters_of_the_eps_commands(self):
+    # pdscomp's pairing on legacy firmware, an 800 count EPS command beside u x 600; the EPS
+    # command is on 1200 here, so the same share is 900. (The interceptor author's own fork
+    # sends it the EPS command's count, clipped to 600.)
     assert TI.STEER_SCALE == 900
     assert TI.STEER_SCALE / CarControllerParams.EPS_STEER_MAX == TI.STEER_MAX / CarControllerParams.TUNE_STEER_MAX
 
@@ -203,6 +204,15 @@ class TestTune:
     assert bp == [float(x) for x in ccp.EPS_CEILING_LOOKUP[0]]
     assert rail == [x / ccp.STEER_MAX for x in ccp.EPS_CEILING_LOOKUP[1]]
     assert get_steer_slew_schedule(stock) == ([0.], [ccp.STEER_DELTA_UP / ccp.STEER_MAX], [ccp.STEER_DELTA_DOWN / ccp.STEER_MAX])
+
+  def test_the_timing_constants_keep_their_reasons(self):
+    # the interceptor's own documentation and the drives on record, not each other
+    assert 0.06 < TI.FEEDBACK_TIMEOUT <= 0.07, "two lost 50 Hz frames and a late one, and 30 ms inside the panda's 100 ms"
+    assert TI.FAULT_T - TI.FEEDBACK_TIMEOUT > 0.242 - 0.02, "the longest feedback pause on record is no fault"
+    assert 1.09 < TI.BYPASS_T <= 1.5, "its slowest watchdog has it in bypass, and past that the EPS's reading is the only one"
+    assert TI.REFIT_T >= TI.STEER_MAX / TI.STEER_DELTA_UP * DT_CTRL, "no count forgotten before the command is back"
+    assert TI.REFIT_T < TI.DROPOUT_T < TI.DROPOUT_ALERT_T
+    assert TI.NOT_READY_ALERT_T > TI.DRIVER_OVER_RELEASE_T + TI.FAULT_T, "a let-go wheel is not named"
 
   def test_the_eps_command_yields_over_the_interceptors_span(self):
     ccp = CarControllerParams(ti_car_params()[0])
@@ -314,6 +324,34 @@ class TestCarState:
     car.run(20, feedback(torque=12))
     assert car.run(TI_BYPASS_FRAMES // 2).steeringPressed
 
+  @pytest.mark.parametrize("peak", [7, 12, 16, -12, TI.STEER_OVERRIDE_NOW])
+  def test_one_noise_peak_before_a_silence_is_not_a_press(self, peak):
+    # what stands through the silence is whether the driver was steering, not the last sample:
+    # counted on every frame of the hold, one peak of the reading's noise (10 to 16 on record)
+    # would be a press five frames in, and would soften the alarm for the fault that follows
+    car = Car()
+    car.run(20, feedback())
+    car.run(2, feedback(torque=peak))
+    for _ in range(TI_BYPASS_FRAMES - 2):
+      assert not car.run(1).steeringPressed
+    assert car.CS.steering_pressed_cnt == 0
+
+  def test_a_feedback_pause_does_not_make_a_press_of_what_was_not_one(self):
+    car = Car()
+    car.run(20, feedback())
+    car.run(4, feedback(torque=12))       # two samples above the threshold: not yet a press
+    assert not car.run(1).steeringPressed
+    for _ in range(24):                   # a pause as long as the longest on record
+      assert not car.run(1).steeringPressed
+    # and the count that was part way there has run down: a third sample starts over
+    assert not car.run(2, feedback(torque=12)).steeringPressed
+
+  def test_a_hard_push_it_reported_last_is_held(self):
+    car = Car()
+    car.run(20, feedback())
+    assert car.run(1, feedback(torque=TI.STEER_OVERRIDE_NOW + 1)).steeringPressed
+    assert car.run(TI_BYPASS_FRAMES // 2).steeringPressed
+
   def test_steering_pressed_threshold_and_filter(self):
     car = Car()
     assert not car.run(20, feedback(torque=TI.STEER_THRESHOLD)).steeringPressed
@@ -361,6 +399,19 @@ class TestCarState:
     assert car.CS.ti_ready
     assert not car.run(4, feedback()).steerFaultTemporary
 
+  @pytest.mark.parametrize("pause", [24, TI_FAULT_FRAMES - TI_FEEDBACK_FRESH_FRAMES])
+  def test_the_longest_feedback_pause_on_record_is_no_fault(self, pause):
+    # 242 ms (pdscomp's logs): it costs the interceptor's torque for the pause, nothing else
+    car = Car()
+    car.CS.ti_stream_frames = TI_BOOT_FRAMES
+    car.speed_kph = 60.
+    car.run(20, feedback())
+    for _ in range(pause):
+      assert not car.run(1).steerFaultTemporary
+    assert not car.CS.ti_ready
+    assert not car.run(300, feedback()).steerFaultTemporary
+    assert not car.CS.ti_not_ready
+
   def test_one_short_dropout_is_no_fault(self):
     car = Car()
     car.speed_kph = 60.
@@ -390,17 +441,109 @@ class TestCarState:
     assert all(faulted[faulted.index(True):])
     # and long enough, it is named
     assert car.CS.ti_not_ready
-    # fit for REFIT_T, it is forgotten
+    # fit for REFIT_T, the fault is dropped
     assert not car.run(TI_REFIT_FRAMES + 2, feedback()).steerFaultTemporary
-    assert not car.CS.ti_not_ready
+    # the name is not: it kept dropping out, and stays named until every dropout is paid off
+    assert car.CS.ti_not_ready and car.CS.ti_dropping_out
+    car.run(TI_DROPOUT_ALERT_FRAMES + TI_DROPOUT_FRAMES, feedback())
+    assert not car.CS.ti_not_ready and car.CS.ti_unfit_cause == TorqueInterceptorCause.NONE
 
-  def test_dropouts_far_apart_do_not_add_up(self):
+  @pytest.mark.parametrize("unfit, fit, fb, fault_on", [
+    (2, 50, feedback(ramp=1), 4), (2, TI_REFIT_FRAMES - 3, feedback(ramp=1), 4),   # 20 ms glitches: 2, 14, 26, 38 frames counted
+    (8, 48, None, 4),                                                              # four feedback frames lost at a time
+    (30, 50, feedback(ramp=1), 2),                                                 # 0.3 s twice
+  ])
+  def test_short_dropouts_inside_the_refit_window_are_a_fault(self, unfit, fit, fb, fault_on):
+    # a dropout that comes before the last one's count was cleared restarts a command that had
+    # not climbed back: it is charged RESTART_T (0.1 s) on top of its own frames
+    assert TI_RESTART_FRAMES == 10 and TI_FAULT_FRAMES == 30
     car = Car()
+    car.CS.ti_stream_frames = TI_BOOT_FRAMES
+    car.speed_kph = 60.
+    car.run(20, feedback())
+    faulted = []
+    for _ in range(20):
+      faulted.append(car.run(unfit, fb).steerFaultTemporary)
+      faulted.append(car.run(fit, feedback()).steerFaultTemporary)
+    # never the first: one dropout up to FAULT_T is no fault
+    assert faulted.index(True) == 2 * (fault_on - 1)
+    assert all(faulted[faulted.index(True):])
+    assert car.CS.ti_not_ready
+
+  def test_dropouts_further_apart_than_the_refit_window_are_no_fault(self):
+    car = Car()
+    car.CS.ti_stream_frames = TI_BOOT_FRAMES
     car.speed_kph = 60.
     car.run(20, feedback())
     for _ in range(20):
       assert not car.run(TI_FAULT_FRAMES - 2, feedback(ramp=1)).steerFaultTemporary
       assert not car.run(TI_REFIT_FRAMES + 2, feedback()).steerFaultTemporary
+      assert car.CS.ti_unfit_frames == 0
+    # each still cost a ramp from zero: kept up like this, it is named (TestNotReadyAlert)
+    assert car.CS.ti_not_ready
+
+  @pytest.mark.parametrize("malformed", [dict(torque=5, copy=0x7F), dict(version=0), dict(state=4)])
+  def test_one_malformed_frame_is_a_fault_at_once(self, malformed):
+    # not a two-cycle dropout: on that frame the panda drops cruise and MADS lateral alike
+    # (mazda.h's quality flag) and refuses both commands until the driver engages again
+    car = Car()
+    car.speed_kph = 60.
+    car.run(20, feedback())
+    assert car.run(1, feedback(**malformed), late=car.i % 2 == 1).steerFaultTemporary
+    assert car.CS.ti_malformed
+    assert car.run(1).steerFaultTemporary
+    # and for REFIT_T after, however healthy the frames that follow
+    assert car.run(TI_REFIT_FRAMES - 4, feedback()).steerFaultTemporary
+    assert not car.CS.ti_malformed and car.CS.ti_ready
+    assert not car.run(8, feedback()).steerFaultTemporary
+
+  @pytest.mark.parametrize("malformed", [dict(torque=5, copy=0x7F), dict(version=0), dict(state=4)])
+  @pytest.mark.parametrize("healthy_last", [True, False])
+  def test_a_malformed_frame_counts_with_a_healthy_one_in_the_same_cycle(self, malformed, healthy_last):
+    # card hands carstate every frame that arrived since its last cycle, and after a late one
+    # that is two: the panda has judged both, so the last one being healthy changes nothing
+    car = Car()
+    car.speed_kph = 60.
+    car.run(TI_REFIT_FRAMES + 20, feedback())
+    first, last = (feedback(**malformed), feedback()) if healthy_last else (feedback(), feedback(**malformed))
+    ret = car.run(1, last, extra=[first], late=car.i % 2 == 1)
+    assert car.CS.ti_malformed and ret.steerFaultTemporary
+    assert car.CS.ti_ready == healthy_last
+    assert car.CS.ti_unfit_cause == TorqueInterceptorCause.MALFORMED
+    assert car.run(TI_REFIT_FRAMES - 4, feedback()).steerFaultTemporary
+    assert car.CS.ti_unfit_cause == TorqueInterceptorCause.MALFORMED
+    assert not car.run(8, feedback()).steerFaultTemporary
+    assert car.CS.ti_unfit_cause == TorqueInterceptorCause.NONE
+
+  def test_a_malformed_frame_at_a_stop_is_a_fault_when_the_car_moves(self):
+    car = Car()
+    car.run(20, feedback())
+    assert not car.run(2, feedback(version=0)).steerFaultTemporary
+    car.speed_kph = 30.
+    assert car.run(1, feedback(version=0)).steerFaultTemporary
+
+  @pytest.mark.parametrize("fb, cause, code", [
+    (None, TorqueInterceptorCause.SILENT, 0),
+    (feedback(torque=5, copy=0x7F), TorqueInterceptorCause.MALFORMED, 0),
+    (feedback(state=TorqueInterceptorState.OFF, viol=0x11, error=3), TorqueInterceptorCause.VIOLATION, 0x11),
+    (feedback(error=0x2A), TorqueInterceptorCause.ERROR, 0x2A),
+    (feedback(state=TorqueInterceptorState.OFF), TorqueInterceptorCause.NOT_RUNNING, TorqueInterceptorState.OFF),
+    (feedback(state=TorqueInterceptorState.DRIVER_OVER), TorqueInterceptorCause.NOT_RUNNING, TorqueInterceptorState.DRIVER_OVER),
+    (feedback(ramp=1), TorqueInterceptorCause.RAMP_DOWN, 0),
+  ])
+  def test_why_it_was_not_fit_is_kept_until_it_has_been_fit_for_good(self, fb, cause, code):
+    # what the alert says: the reason, not whatever the frame of the moment reads. Under
+    # dropouts that keep coming, and for REFIT_T after the last, that frame is a healthy one
+    car = Car()
+    car.speed_kph = 60.
+    car.run(20, feedback())
+    assert car.CS.ti_unfit_cause == TorqueInterceptorCause.NONE
+    car.run(20, fb)
+    assert (car.CS.ti_unfit_cause, car.CS.ti_unfit_code) == (cause, code)
+    car.run(TI_REFIT_FRAMES - 4, feedback())
+    assert car.CS.ti_ready and (car.CS.ti_unfit_cause, car.CS.ti_unfit_code) == (cause, code)
+    car.run(8, feedback())
+    assert (car.CS.ti_unfit_cause, car.CS.ti_unfit_code) == (TorqueInterceptorCause.NONE, 0)
 
   def test_a_latch_is_not_forgotten_at_a_stop(self):
     # latched off while moving: the fault waits for the car to move again, what was counted
@@ -442,6 +585,27 @@ class TestCarState:
     assert not car.run(20, feedback()).steerFaultTemporary
     # stuck there with nobody on the wheel, it is a fault like any other
     assert car.run(TI_DRIVER_OVER_RELEASE_FRAMES + TI_FAULT_FRAMES + 20, feedback(state=over)).steerFaultTemporary
+
+  def test_stepping_aside_for_the_driver_counts_as_fit_toward_a_fault_clearing(self):
+    # a fault counted against it, then the driver steers through it: those frames are the
+    # interceptor working, and REFIT_T of them clears the count like RUN does
+    car = Car()
+    car.speed_kph = 60.
+    car.run(20, feedback())
+    assert car.run(TI_FAULT_FRAMES + 10, feedback(ramp=1)).steerFaultTemporary
+    over = feedback(torque=60, state=TorqueInterceptorState.DRIVER_OVER)
+    assert car.run(TI_REFIT_FRAMES - 10, over).steerFaultTemporary
+    assert not car.run(20, over).steerFaultTemporary
+
+  def test_the_excuse_needs_the_interceptor_to_be_saying_so(self):
+    # DRIVER_OVER was the last thing it said, the hand is still on the wheel (the held
+    # reading), and it has gone silent: that is silence, not stepping aside
+    car = Car()
+    car.CS.ti_stream_frames = TI_BOOT_FRAMES
+    car.speed_kph = 60.
+    car.run(40, feedback(torque=60, state=TorqueInterceptorState.DRIVER_OVER))
+    ret = car.run(TI_FEEDBACK_FRESH_FRAMES + TI_FAULT_FRAMES + 2)
+    assert ret.steeringPressed and ret.steerFaultTemporary
 
   def test_unfit_at_a_stop_is_no_fault(self):
     # it is sent nothing below MIN_SPEED and may sit out a stop in its own time
@@ -530,6 +694,26 @@ class TestNotReadyAlert:
     car.run(TI_REFIT_FRAMES + 2, feedback())
     assert not car.CS.ti_not_ready
 
+  def test_named_it_takes_no_new_engagement_moving_or_stopped(self):
+    # stopped there is no steer fault to refuse cruise, and SET under the standing alert would
+    # be the take-control alarm on pulling away: carNotReady is upstream's no-entry and nothing more
+    car = self.streaming(Car())
+    car.speed_kph = 50.
+    assert not car.run(20, feedback()).carNotReady
+    latched = feedback(state=TorqueInterceptorState.OFF, viol=0x11)
+    ret = car.run(TI_NOT_READY_ALERT_FRAMES + 5, latched)
+    assert ret.carNotReady and ret.steerFaultTemporary
+    car.speed_kph = 0.
+    ret = car.run(100, latched)
+    assert ret.carNotReady and not ret.steerFaultTemporary
+    assert not car.run(TI_REFIT_FRAMES + 2, feedback()).carNotReady
+
+  def test_a_car_without_one_is_never_not_ready(self):
+    CP = car_params(CAR.MAZDA_CX5)
+    CI = CarInterface(CP, car_params_sp(CP, CAR.MAZDA_CX5))
+    ret, _ = CI.update([(0, [])])
+    assert not ret.carNotReady
+
   def test_not_at_a_stop_and_not_for_the_driver_steering_through_it(self):
     car = self.streaming(Car())
     car.run(TI_NOT_READY_ALERT_FRAMES * 2, feedback(state=TorqueInterceptorState.OFF, viol=0x12))
@@ -542,10 +726,54 @@ class TestNotReadyAlert:
     car = self.streaming(Car())
     car.speed_kph = 50.
     car.run(20, feedback())
-    for _ in range(4):
+    for _ in range(3):
       car.run(TI_NOT_READY_ALERT_FRAMES // 2, feedback(state=TorqueInterceptorState.OFF, viol=0x12))
       car.run(TI_REFIT_FRAMES + 2, feedback())
     assert not car.CS.ti_not_ready
+
+  def test_dropping_out_again_and_again_is_named_without_a_fault(self):
+    # a 20 ms ramp-down a little over once a second: never a fault, the count is cleared
+    # between them, and every one a restart of the command from zero. More often than once in
+    # DROPOUT_T, kept up, it is named
+    car = self.streaming(Car())
+    car.speed_kph = 50.
+    car.run(20, feedback())
+    named_after = None
+    for n in range(1, 13):
+      assert not car.run(2, feedback(ramp=1)).steerFaultTemporary
+      assert not car.run(TI_REFIT_FRAMES + 10, feedback()).steerFaultTemporary
+      if named_after is None and car.CS.ti_not_ready:
+        named_after = n
+    # each owes DROPOUT_T and pays off its own 1.12 s: the fifth takes it past DROPOUT_ALERT_T
+    assert named_after == 5
+    # the frame of the moment is a healthy one; what the driver is told is why it drops out
+    assert car.CS.ti_ready and car.CS.ti_unfit_cause == TorqueInterceptorCause.RAMP_DOWN
+    # it stays named, coming and going with every dropout would be an alert of its own each
+    # time, until all of it is paid off
+    car.run(TI_DROPOUT_ALERT_FRAMES - 2 * TI_REFIT_FRAMES, feedback())
+    assert car.CS.ti_not_ready
+    car.run(TI_DROPOUT_FRAMES + 2 * TI_REFIT_FRAMES, feedback())
+    assert not car.CS.ti_not_ready and not car.CS.ti_dropping_out
+    assert car.CS.ti_unfit_cause == TorqueInterceptorCause.NONE
+
+  def test_a_dropout_now_and_then_is_not_named(self):
+    car = self.streaming(Car())
+    car.speed_kph = 50.
+    car.run(20, feedback())
+    for _ in range(12):
+      car.run(24)
+      car.run(TI_DROPOUT_FRAMES + 20, feedback())
+      assert not car.CS.ti_not_ready
+    assert car.CS.ti_dropout_frames == 0
+
+  def test_dropouts_at_a_stop_are_not_counted(self):
+    # stopped it is sent nothing: what it does there costs no command a restart
+    car = self.streaming(Car())
+    car.run(20, feedback())
+    for _ in range(12):
+      car.run(2, feedback(ramp=1))
+      car.run(60, feedback())
+    assert car.CS.ti_dropout_frames == 0 and not car.CS.ti_not_ready
 
 
 class TestWire:
@@ -746,10 +974,48 @@ class TestController:
   def test_slowing_to_a_stop_takes_the_request_down_to_zero(self):
     cc, cs = ti_controller()
     for _ in range(100):
-      step(cc, cs, torque=0.5, v_ego=5., **LAT)
+      _, sends = step(cc, cs, torque=0.5, v_ego=5., **LAT)
+    top = ti_torque(sends)
+    assert at_rest_on(top, 450)
+    # a walk at its own down rate, as when openpilot lets go, not a cut
+    seen = []
     for _ in range(40):
       _, sends = step(cc, cs, torque=0.5, v_ego=0.5, **LAT)
+      seen.append(ti_torque(sends))
+    assert seen[:2] == [top - TI.STEER_DELTA_DOWN, top - 2 * TI.STEER_DELTA_DOWN]
     assert ti_torque(sends) == 0
+
+  def test_with_the_interceptor_quiet_the_eps_command_yields_on_the_eps_reading(self):
+    # carstate holds the interceptor's last reading through its silence (BYPASS_T), and so
+    # does the panda. A driver who starts pushing then shows only on the EPS's own reading
+    cc, cs = ti_controller(CAR.MAZDA_CX5, car_fw=STEER_TO_ZERO_FW)
+
+    def eps_torque(sends):
+      dat = frame(sends, CAM_LKAS)
+      return (((dat[0] & 0x0F) << 8) | dat[1]) - 2048
+
+    cs.ti_fresh = True
+    for _ in range(100):
+      _, sends = step(cc, cs, torque=0.5, v_ego=20., **LAT)
+    assert eps_torque(sends) == 600
+    # talking, the interceptor's reading is the driver's and the EPS's is its bias: ignored
+    cs.eps_driver_torque = -80.
+    for _ in range(20):
+      _, sends = step(cc, cs, torque=0.5, v_ego=20., **LAT)
+    assert eps_torque(sends) == 600
+    # quiet, the held reading says nothing of a push that began since
+    cs.ti_fresh = cs.ti_ready = False
+    seen = []
+    for _ in range(70):
+      _, sends = step(cc, cs, torque=0.5, v_ego=20., **LAT)
+      seen.append(eps_torque(sends))
+    assert seen[9] <= 600 - 10 * cc.params.STEER_DELTA_DOWN + 1, "walking down inside 100 ms"
+    assert seen[-1] == 0
+    # a reading with the command's sign, the interceptor's bias if any is left, takes nothing
+    cs.eps_driver_torque = 80.
+    for _ in range(100):
+      _, sends = step(cc, cs, torque=0.5, v_ego=20., **LAT)
+    assert eps_torque(sends) == 600
 
   @pytest.mark.parametrize("sign", [1, -1])
   def test_the_driver_takes_it_all(self, sign):
@@ -970,7 +1236,7 @@ class TestClosedLoopThroughThePanda:
     profile = [(0.6, 0, 20., {}) for _ in range(150)] + [(0.6, 0, 20., None) for _ in range(100)] + \
               [(0.6, 0, 20., {}) for _ in range(150)]
     refused, admitted, *_ = self.loop(profile)
-    # the controller's 60 ms is inside the panda's 100 ms: it stops before it is refused
+    # the controller's 70 ms is inside the panda's 100 ms: it stops before it is refused
     assert refused == []
     assert set(admitted[160:250]) == {0}
     assert at_rest_on(admitted[-1], 540)

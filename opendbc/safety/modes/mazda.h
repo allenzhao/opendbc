@@ -77,9 +77,11 @@ static void mazda_ti_reset_torque_state(void) {
   mazda_ti_ts_torque_check_last = microsecond_timer_get();
 }
 
-// A healthy frame recent enough to act on. Staleness latches until the next healthy frame, so a
-// timer wrap cannot make an old one look fresh again: called on every frame the mode hears and
-// on every interceptor command, steering or not.
+// A healthy frame recent enough to act on. Staleness latches until the next healthy frame, so
+// that the timer's wrap, 71 minutes on, does not make an old one read fresh again. The latch
+// is kept by every frame the RX checks admit and every frame on the TX list the host sends,
+// steering or not; only a panda that sees neither for the whole of those 71 minutes still
+// has that corner.
 static bool mazda_ti_feedback_fresh(void) {
   if (safety_get_ts_elapsed(microsecond_timer_get(), mazda_ti_feedback_ts) > MAZDA_TI_FEEDBACK_TIMEOUT_US) {
     mazda_ti_healthy = false;
@@ -165,7 +167,7 @@ static bool mazda_radar_capture_msg_valid(const CANPacket_t *msg) {
 // track msgs coming from OP so that we know what CAM msgs to drop and what to forward
 static void mazda_rx_hook(const CANPacket_t *msg) {
   if (mazda_ti) {
-    // keep the staleness latch current while nothing is being sent to the interceptor
+    // keep the staleness latch current while nothing is being sent
     (void)mazda_ti_feedback_fresh();
   }
 
@@ -363,6 +365,12 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   bool tx = true;
   bool main_bus = msg->bus == (unsigned char)MAZDA_MAIN;
   bool long_replacement_bus = main_bus || (msg->bus == (unsigned char)MAZDA_CAM);
+
+  if (mazda_ti) {
+    // as in the RX hook: every frame the host sends, the EPS command included, keeps the
+    // staleness latch current
+    (void)mazda_ti_feedback_fresh();
+  }
 
   if (main_bus && (msg->addr == MAZDA_LKAS)) {
     int desired_torque = (((msg->data[0] & 0x0FU) << 8) | msg->data[1]) - 2048U;

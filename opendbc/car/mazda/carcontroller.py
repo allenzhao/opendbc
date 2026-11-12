@@ -114,6 +114,12 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
 
       # Yield a share of the command to a driver pushing against it.
       driver_opposing = -np.sign(new_torque) * CS.out.steeringTorque
+      if self.torque_interceptor and not CS.ti_fresh:
+        # The interceptor has gone quiet and its last reading stands in carstate (BYPASS_T), as
+        # it does in the panda. A driver who starts pushing now shows only on the EPS's own
+        # reading: yield to whichever says more. Whatever bias the interceptor leaves on that
+        # reading has the command's sign, so it can only add to the yielding.
+        driver_opposing = max(driver_opposing, -np.sign(new_torque) * CS.eps_driver_torque)
       new_torque = int(round(new_torque * float(np.interp(driver_opposing, self.params.STEER_OVERRIDE_BP,
                                                           self.params.STEER_OVERRIDE_V))))
 

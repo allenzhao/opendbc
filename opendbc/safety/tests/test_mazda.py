@@ -134,6 +134,42 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
       self.safety.set_mads_params(False, False, False)
       self.safety.set_controls_allowed_lateral(False)
 
+  def test_a_refusal_under_mads_restarts_the_realtime_window(self):
+    # the same gate takes the realtime reference and its window with it: left where they stood
+    # when lateral fell, a host could climb past the realtime limit the moment it rises
+    self.safety.set_mads_params(True, False, False)
+    try:
+      steps = self.MAX_RT_DELTA // self.MAX_RATE_UP
+      # a reference left high from before lateral fell is gone after one refused frame
+      self.safety.set_timer(0)
+      self.safety.set_controls_allowed(True)
+      self.safety.set_controls_allowed_lateral(False)
+      self.safety.set_rt_torque_last(self.MAX_RT_DELTA)
+      self.assertFalse(self._tx(self._torque_cmd_msg(0)))
+      self.safety.set_controls_allowed_lateral(True)
+      torque = 0
+      for _ in range(steps):
+        torque += self.MAX_RATE_UP
+        self.assertTrue(self._tx(self._torque_cmd_msg(torque)), torque)
+      self.assertFalse(self._tx(self._torque_cmd_msg(torque + self.MAX_RATE_UP)))
+
+      # and the window runs from the last refused frame, not from wherever it stood
+      self.safety.set_controls_allowed_lateral(False)
+      self.assertFalse(self._tx(self._torque_cmd_msg(0)))      # a window opens at t = 0
+      self.safety.set_timer(common.RT_INTERVAL - 10_000)
+      self.assertFalse(self._tx(self._torque_cmd_msg(0)))      # the last refusal, 10 ms before that window would roll
+      self.safety.set_controls_allowed_lateral(True)
+      torque = 0
+      for _ in range(steps):
+        torque += self.MAX_RATE_UP
+        self.assertTrue(self._tx(self._torque_cmd_msg(torque)), torque)
+      self.safety.set_timer(common.RT_INTERVAL + 1)
+      self.assertTrue(self._tx(self._torque_cmd_msg(torque)))  # a stale window would roll here and take this as its reference
+      self.assertFalse(self._tx(self._torque_cmd_msg(torque + self.MAX_RATE_UP)))
+    finally:
+      self.safety.set_mads_params(False, False, False)
+      self.safety.set_controls_allowed_lateral(False)
+
   def test_stock_passthrough(self):
     # one sender per address, the Tesla test_stock_lkas_passthrough shape: the camera owns
     # 0x243/0x440 whenever openpilot is not steering (stock lane keep, TJA/CTS and dash LDW
@@ -1214,8 +1250,9 @@ class TestMazdaTorqueInterceptorCommand(unittest.TestCase):
 
   def test_staleness_latches_while_openpilot_is_not_steering(self):
     # The same wrap with nothing engaged through the silence: the latch is kept by every frame
-    # the mode hears and every idle command, not only by torque checked while steering.
-    for witness in ("idle command", "vehicle frame"):
+    # the RX checks admit and every frame on the TX list the host sends, not only by torque
+    # checked while steering.
+    for witness in ("idle command", "vehicle frame", "EPS command"):
       self.safety.set_controls_allowed(True)
       self._hear()
       self.assertTrue(self._tx(TI.STEER_DELTA_UP))
@@ -1224,8 +1261,10 @@ class TestMazdaTorqueInterceptorCommand(unittest.TestCase):
       self._advance(TI_FEEDBACK_TIMEOUT_US + 1)
       if witness == "idle command":
         self.assertTrue(self._tx(0))
-      else:
+      elif witness == "vehicle frame":
         self.safety.safety_rx_hook(self.packer.make_can_msg_safety("ENGINE_DATA", 0, {}))
+      else:
+        self.safety.safety_tx_hook(self.packer.make_can_msg_safety("CAM_LKAS", 0, {"LKAS_REQUEST": 0}))
       # 71 minutes on, the timer reads as it did 50 ms after that last frame
       self._advance(-(TI_FEEDBACK_TIMEOUT_US // 2))
       self.safety.set_controls_allowed(True)

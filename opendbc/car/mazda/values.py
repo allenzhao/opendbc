@@ -183,8 +183,19 @@ class TorqueInterceptorParams:
   # pause on record is 242 ms (pdscomp's logs).
   FAULT_T = 0.3                   # s
   # Unfit frames add up until it has been fit this long: every one restarts its command from
-  # zero, so unfitness in bursts steers no better than unfitness that stays.
-  REFIT_T = 0.5                   # s
+  # zero, so unfitness in bursts steers no better than unfitness that stays. The time the
+  # command takes to climb back to its clip, so a count is never forgotten before the command
+  # could have recovered.
+  REFIT_T = STEER_MAX / STEER_DELTA_UP * DT_CTRL   # s (1.0)
+  # What a further dropout inside that window is charged on top of its own frames: it restarts
+  # a command that had not yet climbed back.
+  RESTART_T = 0.1                 # s
+  # Dropouts further apart than REFIT_T never add up to a fault, but each still costs a ramp
+  # from zero. Every one is held against the TI for DROPOUT_T, and DROPOUT_ALERT_T of that owed
+  # names it to the driver (no fault): more often than once in DROPOUT_T, kept up. The name
+  # stays until all of it is paid off.
+  DROPOUT_T = 3.0                 # s
+  DROPOUT_ALERT_T = 9.0           # s
   # Gone silent, it may still be biasing the sensor until its own watchdogs put it in bypass
   # (its documentation: 0.6 s for a lost CAN link, 1.09 s for a hung CPU). Until then the EPS's
   # reading is not the driver's and the TI's last one stands.
@@ -209,6 +220,18 @@ class TorqueInterceptorState(IntEnum):
   OFF = 1           # start-up or recovery delay, or a latched violation
   DRIVER_OVER = 2   # the driver is steering harder than the TI can pass: it steps aside
   RUN = 3
+
+
+class TorqueInterceptorCause(IntEnum):
+  # Why the TI was last not fit, kept until it has been fit for REFIT_T: what the driver is
+  # told. Published by card as CarStateZP.torqueInterceptor.cause, in this order.
+  NONE = 0
+  SILENT = 1        # no feedback
+  MALFORMED = 2     # torque bytes disagree, version zero or a state past RUN
+  VIOLATION = 3     # its violation byte, the code that goes with this
+  ERROR = 4         # its logic error byte, the code that goes with this
+  NOT_RUNNING = 5   # discover, off or driver override with nothing else wrong
+  RAMP_DOWN = 6     # taking its bias to zero by itself
 
 
 @dataclass
